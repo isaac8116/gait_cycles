@@ -157,8 +157,17 @@ class Keypoints:
         if self.meta.get("fps"):
             return float(self.meta["fps"])
         if self.n_frames > 1:
-            return float(1.0 / np.median(np.diff(self.time_s)))
+            return sample_rate(self.time_s)
         raise FormatError("Cannot infer fps from a single frame and no meta['fps']")
+
+    @property
+    def rate(self) -> float:
+        """Rate at which these samples were actually taken, from ``time_s``.
+
+        Differs from :attr:`fps` for decimated copies whose meta was not
+        updated, and is what filters and frame-based metrics should use.
+        """
+        return sample_rate(self.time_s, nominal=self.meta.get("fps"))
 
     def has(self, name: str) -> bool:
         return name in self.names
@@ -312,6 +321,28 @@ def write_events(df: pd.DataFrame, path: str | Path) -> Path:
 # Labels are events written by a person or a simulator; the format is identical.
 read_labels = read_events
 write_labels = write_events
+
+
+def sample_rate(time_s: Sequence[float] | np.ndarray, nominal: float | None = None, rel_tol: float = 0.01) -> float:
+    """Sampling rate of a stream of frame times, in Hz.
+
+    Uses the mean interval ``(n - 1) / (t[-1] - t[0])``, not the median. A
+    240 fps iPhone clip stored in a 1/600 s time base alternates 2- and 3-tick
+    intervals, so its median interval reads as 200 or 300 fps while the mean
+    is exactly 240. When ``nominal`` (e.g. ``meta['fps']``) agrees with the
+    measured rate within ``rel_tol``, the nominal value is returned, so
+    rounding in the timestamps does not leak into results.
+    """
+    t = np.asarray(time_s, dtype=float)
+    t = t[np.isfinite(t)]
+    if len(t) < 2 or t[-1] <= t[0]:
+        if nominal:
+            return float(nominal)
+        raise FormatError("Need at least two increasing frame times to measure a sample rate")
+    measured = (len(t) - 1) / (t[-1] - t[0])
+    if nominal and abs(measured - float(nominal)) <= rel_tol * float(nominal):
+        return float(nominal)
+    return float(measured)
 
 
 def frames_to_times(frames: Sequence[int] | np.ndarray, kp: Keypoints) -> np.ndarray:
