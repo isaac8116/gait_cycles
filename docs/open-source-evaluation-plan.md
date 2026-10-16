@@ -33,6 +33,25 @@ Install check (done 16 Oct in a clean Python 3.13 venv): `pip install myogait==0
 
 Record versions with `pip freeze`, not `__version__`.
 
+### 1a. Our hardware and what it changes
+
+Equipment available (confirmed 16 Oct): a MacBook with **no GPU**, an **iPhone** (60 fps video, 240 fps slow motion, LiDAR scanning) and an **Intel RealSense D455**.
+
+| Device | What it gives us | Role in the tests | Watch out for |
+|---|---|---|---|
+| MacBook CPU | Runs MediaPipe and RTMW (ONNX) pose models, all event detectors and scoring | All local runs | Sapiens 2 and large ViTPose are GPU models. Drop them from local runs, or borrow a free cloud GPU for a handful of clips if E3 needs them |
+| iPhone, 60 fps video | Main side-on clips of teammates | L2 clips, labelled by hand | iPhone video can have a variable frame rate, so the harness stores the real timestamp of every frame. The built-in Camera app can't set shutter speed; an app with manual control (e.g. Blackmagic Camera) can, and a short shutter reduces blur on swinging feet |
+| iPhone, 240 fps slow motion | ~4 ms timing resolution | Timing reference for a subset of L2 clips | Slow-motion files play back slowed down, but the frames carry the real 240 fps timestamps; read those, not the playback rate |
+| iPhone LiDAR scan | Body measurements (height, leg length, foot length) | Ground truth for myogait's `femur_mm`/`foot_mm` scaling and for our body-measure features | Scan accuracy is about a centimetre at best; take a tape-measure height too |
+| RealSense D455, colour | **Global-shutter** colour camera, up to 1280×800 (higher frame rates at lower resolutions; list them with `gaitbench realsense-modes`) | The **trolley camera in E5**. Its global shutter matches what the rig camera needs, which the iPhone's rolling shutter does not | 30 fps at full resolution is half the frame rate of the iPhone. Check which modes reach 60 fps |
+| RealSense D455, depth | Distance to each pixel | Metric ground truth for stride length, alongside taped footprints (E5) | Depth error grows with distance (roughly 2% at 4 m by Intel's spec), so keep the walker within a few metres |
+
+Effect on the experiments:
+- **E1 (reproduce myogait's numbers).** Their numbers used Sapiens 2 on a GPU. On CPU we run the same BioCV clips with MediaPipe and RTMW instead. That tells us something new: how far accuracy drops with CPU-sized models.
+- **E2 (detector shoot-out).** Use RTMW keypoints. It runs on CPU and has heel and toe points.
+- **E3 (backend comparison).** Compare MediaPipe, RTMW and YOLO locally. Record frames per second on the MacBook as one of the scores.
+- **E5 (moving camera).** Mount the D455 on the trolley and keep the iPhone fixed. Sync the two with a clap or an LED flash visible to both.
+
 ---
 
 ## 2. Questions this plan answers
@@ -161,8 +180,8 @@ Run these in order. The full product of backends × detectors × conditions is t
 |---|---|---|---|---|---|
 | **E0** Install and smoke | Does each candidate install and run here? | — | Each tool, in its own venv | L0, one L2 clip | Runs end to end; events look right overlaid on video; install problems logged |
 | **E1** Reproduce | Do we get myogait's published numbers? | myogait 0.8.9 + their `validation/` code, then 0.9.1 | Version | L1b | Within the published SDs (e.g. initial contact −6 ± 26 ms). If not, stop and find out why before going on |
-| **E2** Detector shoot-out | Which event rule is most accurate? | One strong backend (RTMW, or Sapiens 2 if a GPU is available) | All 15 myogait methods, `event_consensus`, our Zeni, Stenum port, Pose2Sim forward and height methods | L1a/L1b, L2 | Heel-strike MAE ≤ 2 frames at 60 fps; toe-off MAE ≤ 3 frames; ≥ 95% of events found. Keep the top 2–3 |
-| **E3** Backend comparison | Which pose model is good enough on feet? | Top detector from E2 | MediaPipe, RTMW, YOLO, ViTPose, Sapiens 2 | L1, L2 | Foot-point dropout < 10% of frames; event bar as E2; joint-angle RMSE ≤ 6° hip/knee, ≤ 8° ankle; runtime and licence recorded |
+| **E2** Detector shoot-out | Which event rule is most accurate? | One backend with foot points that runs on CPU (RTMW) | All 15 myogait methods, `event_consensus`, our Zeni, Stenum port, Pose2Sim forward and height methods | L1a/L1b, L2 | Heel-strike MAE ≤ 2 frames at 60 fps; toe-off MAE ≤ 3 frames; ≥ 95% of events found. Keep the top 2–3 |
+| **E3** Backend comparison | Which pose model is good enough on feet? | Top detector from E2 | MediaPipe, RTMW, YOLO on the MacBook CPU; ViTPose and Sapiens 2 only if a cloud GPU is borrowed | L1, L2 | Foot-point dropout < 10% of frames; event bar as E2; joint-angle RMSE ≤ 6° hip/knee, ≤ 8° ankle; runtime and licence recorded |
 | **E4** Stress | Where does it break? | Best backend + detector | fps 60/30; walking left→right vs right→left; near vs far limb; mid-stride start; resolution downscaled; clothing change (GPJATK) | L1, L2 | Degradation stays within the bar at 60 fps for near-side limb; record limits for the rest |
 | **E5** Moving camera | Is a tracking camera safe? | Top 2–3 detectors | Fixed vs trolley camera, same walk | L3 | Mean event difference between cameras within 1 frame; velocity detectors expected to fail. Also checks myogait's walking direction and stride length against taped footprints |
 | **E6** Golden set | Will an upgrade change our numbers? | The chosen configuration | Tool version | ~10 clips from L1–L3 with saved outputs | Events move ≤ 1 frame; cycle counts unchanged. Rerun on every upgrade |
@@ -264,7 +283,8 @@ gait_cycles/
 
 ## Open questions
 
-- [ ] **GPU.** Do we have one for Sapiens 2 / ViTPose, or is the decision limited to CPU backends (MediaPipe, RTMW)?
+- [x] **GPU.** None: a MacBook CPU only. Local runs use MediaPipe and RTMW (see [1a](#1a-our-hardware-and-what-it-changes)).
+- [ ] **MacBook chip.** Apple Silicon or Intel? The D455 driver wheel for macOS (`pyrealsense2-macosx`) is built for Apple Silicon only.
 - [ ] **Licence constraints from HTX.** Are AGPL code or non-commercial model weights acceptable in a prototype? In a delivered system?
 - [ ] **Dataset access.** Who signs the GPJATK and BioCV agreements, and where may the data be stored?
 - [ ] **Labelling.** Who are the two raters, and how many clips can they label before the gate?

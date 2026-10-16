@@ -1,0 +1,21 @@
+# Data never goes into git: dataset licences (GPJATK, BioCV) forbid redistribution,
+# and our own clips show identifiable people.
+data/
+results/runs/
+*.mp4
+*.mov
+*.avi
+*.bag
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# OS
+.DS_Store

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaitbench"
+version = "0.1.0"
+description = "Test harness for comparing open-source gait event and cycle tools on the same clips"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+# Video reading, the labelling tool and video overlays.
+video = ["opencv-python>=4.8"]
+# myogait pipeline + gaitkit detectors (pinned: see docs/open-source-evaluation-plan.md, E6).
+myogait = ["myogait==0.9.1", "gaitkit==1.4.9"]
+# CPU pose backends run through myogait. RTMW models download from openmmlab.com on first use.
+pose = ["myogait[mediapipe,rtmw]==0.9.1"]
+# Intel RealSense D455 capture. No official macOS wheel exists; on Apple Silicon the
+# community wheel `pyrealsense2-macosx` is used instead (see docs/harness.md).
+realsense = [
+    "pyrealsense2>=2.56; sys_platform != 'darwin'",
+    "pyrealsense2-macosx>=2.56; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+gaitbench = "gaitbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "myogait: needs myogait and gaitkit installed",
+    "video: needs opencv installed",
+]
