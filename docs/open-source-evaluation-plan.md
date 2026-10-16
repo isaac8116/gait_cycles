@@ -52,6 +52,20 @@ Effect on the experiments:
 - **E3 (backend comparison).** Compare MediaPipe, RTMW and YOLO locally. Record frames per second on the MacBook as one of the scores.
 - **E5 (moving camera).** Mount the D455 on the trolley and keep the iPhone fixed. Sync the two with a clap or an LED flash visible to both.
 
+#### Phone-only route (while the D455 is away)
+
+Everything except the global-shutter check and depth-based stride length can be done with the iPhone alone.
+
+- **One recording gives both the truth and the test clip.** Record passes in Slo-mo at 240 fps and label those frame by frame (≈ 4 ms resolution). `gaitbench decimate` then keeps every 4th or 8th frame to make 60 fps and 30 fps copies of the same recording. Detectors run on the copies and are scored against the 240 fps labels. Scoring matches events by time, so no clap is needed, and the two versions are perfectly in sync. This replaces the "second phone at 240 fps" idea in the data ladder.
+- **Moving camera.** Put the phone on a trolley, office chair or cart pushed alongside the walker at a steady distance. Record at 240 fps and label the moving clip itself.
+  - Comparing detector errors on moving passes with fixed passes answers E5 without a second camera.
+  - If a teammate's phone is free as a fixed camera at the same time, the comparison becomes paired (sync with a clap).
+- **Caveats.**
+  - Turn video stabilisation off if the app allows it (e.g. Blackmagic Camera); electronic stabilisation warps frames when the phone moves.
+  - The iPhone's rolling shutter skews fast-moving feet, and the rig camera won't have that. A pass with the phone is encouraging but not final; repeat E5 with the D455.
+  - Slo-mo needs bright light: outdoors, or a well-lit corridor.
+- **Stride length.** Chalk or tape marks at heel strikes, measured with a tape, until the D455's depth is available.
+
 ---
 
 ## 2. Questions this plan answers
