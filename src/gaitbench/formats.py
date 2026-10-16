@@ -291,8 +291,15 @@ def validate_events(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(["clip_id", "side", "event", "frame"], kind="stable").reset_index(drop=True)
 
 
+_TEXT_COLUMNS = ("clip_id", "tool", "tool_version", "backend", "detector", "side", "event")
+
+
 def read_events(path: str | Path) -> pd.DataFrame:
-    return validate_events(pd.read_csv(path, dtype={"tool_version": str}, keep_default_na=True))
+    # Read IDs as text so a clip or rater called "01" does not come back as 1.
+    df = pd.read_csv(path, dtype={c: str for c in _TEXT_COLUMNS}, keep_default_na=False, na_values={
+        "frame": [""], "time_s": [""], "confidence": ["", "nan", "NaN"],
+    })
+    return validate_events(df)
 
 
 def write_events(df: pd.DataFrame, path: str | Path) -> Path:

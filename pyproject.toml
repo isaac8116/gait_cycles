@@ -43,4 +43,5 @@ testpaths = ["tests"]
 markers = [
     "myogait: needs myogait and gaitkit installed",
     "video: needs opencv installed",
+    "slow: downloads a model or runs a pose backend; deselect with -m 'not slow'",
 ]

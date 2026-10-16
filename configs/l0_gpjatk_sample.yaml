@@ -1,0 +1,44 @@
+# Data ladder level 0: the GPJATK sample (subject p01, left and right sagittal cameras) from Stenum's
+# GaitAnalysis-PoseEstimation repo, as OpenPose BODY_25 JSON. There is no ground truth for it, so
+# detectors are compared with our Zeni (agreement), and the plots are checked by eye.
+#
+#   python scripts/fetch_sample_data.py          # once; files stay in data/ (git-ignored)
+#   gaitbench run configs/l0_gpjatk_sample.yaml
+#
+# GPJATK (Kwolek et al. 2019) is released for scientific use under a release agreement:
+# cite the paper and do not redistribute the files.
+# Relative paths are resolved against the directory gaitbench is run from (the repo root).
+
+run_id: l0_gpjatk_sample
+description: OpenPose keypoints of GPJATK p01 (sagittal views), detector agreement without truth
+data_root: data/gpjatk_sample
+results_root: results/runs
+
+# Converted before detection. 25 fps, 960x540 is the sample's video format.
+import_openpose:
+  - json_dir: data/raw/gpjatk_sample/C_Sag_Left/JSON Files
+    clip_id: gpjatk_p01s01_sag_left
+    fps: 25
+    width: 960
+    height: 540
+  - json_dir: data/raw/gpjatk_sample/C_Sag_Right/JSON Files
+    clip_id: gpjatk_p01s01_sag_right
+    fps: 25
+    width: 960
+    height: 540
+
+clips: all
+backends: [openpose]
+detectors:
+  - ours
+  - myogait:zeni
+  - myogait:gk_zeni
+  - myogait:gk_bike
+  - myogait:gk_oconnor
+  - myogait:consensus
+detector_params: {}
+
+truth_rater: null
+reference_detector: zeni
+tolerance_ms: 100
+plots: true

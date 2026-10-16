@@ -1,0 +1,39 @@
+# Smoke test of the whole harness on synthetic walks: no video, no GPU, about a minute on a laptop CPU.
+#
+#   gaitbench run configs/smoke_synthetic.yaml
+#
+# Checks that every detector finds the events of a kinematic stick figure with a fixed and with a
+# panning camera, in both walking directions. Accuracy here says nothing about real people (see
+# gaitbench/synthetic.py); a detector that fails *this* is broken, not merely inaccurate.
+# Relative paths are resolved against the directory gaitbench is run from (the repo root).
+
+run_id: smoke_synthetic
+description: Synthetic fixed and panning camera, our detectors vs a few myogait methods
+data_root: data/synthetic
+results_root: results/runs
+
+# Written before detection, overwriting earlier copies. Keys are those of `gaitbench simulate`.
+# 6 s clips: with the simulator's 5 s default a heel strike lands on the last frame.
+simulate:
+  - {clip_id: syn_fixed_ltr, fps: 60, pan: 0.0, direction: ltr, duration: 6}
+  - {clip_id: syn_pan_ltr, fps: 60, pan: follow, direction: ltr, duration: 6}
+  - {clip_id: syn_pan_rtl, fps: 60, pan: follow, direction: rtl, duration: 6}
+  - {clip_id: syn_pan_rtl_noisy, fps: 60, pan: follow, direction: rtl, noise_px: 1.5, dropout: 0.02, duration: 6, seed: 1}
+  - {clip_id: syn_fixed_30fps, fps: 30, pan: 0.0, direction: ltr, duration: 6}
+
+clips: all
+backends: [synthetic]
+# Groups: ours (zeni, stenum), myogait (all myogait methods), all. List names with `gaitbench list-detectors`.
+detectors:
+  - ours
+  - myogait:zeni
+  - myogait:gk_zeni
+  - myogait:gk_bike
+  - myogait:gk_oconnor
+  - myogait:consensus
+detector_params: {}
+
+truth_rater: truth
+reference_detector: zeni   # also report agreement with our Zeni (the plan's decision rule)
+tolerance_ms: 100
+plots: true
