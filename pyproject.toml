@@ -19,13 +19,24 @@ dependencies = [
 
 [project.optional-dependencies]
 # Video reading, the labelling tool and video overlays.
+# opencv-python, opencv-python-headless (required by myogait) and opencv-contrib-python (required
+# by mediapipe) all install the same cv2; whichever pip installs last wins. If it is the headless
+# one, `gaitbench label` cannot open a window. Repair after installing the myogait/pose extras,
+# without uninstalling anything (the packages share files):
+#   pip install --force-reinstall --no-deps opencv-python==<installed version>
+# `gaitbench env` checks for this and prints the exact command.
 video = ["opencv-python>=4.8"]
 # myogait pipeline + gaitkit detectors (pinned: see docs/open-source-evaluation-plan.md, E6).
 myogait = ["myogait==0.9.1", "gaitkit==1.4.9"]
 # CPU pose backends run through myogait. RTMW models download from openmmlab.com on first use.
 pose = ["myogait[mediapipe,rtmw]==0.9.1"]
 # Intel RealSense D455 capture. No official macOS wheel exists; on Apple Silicon the
-# community wheel `pyrealsense2-macosx` is used instead (see docs/harness.md).
+# community wheel `pyrealsense2-macosx` is used instead (see docs/harness.md). Its only release
+# that meets the pin, 2.56.5, ships macosx_15_0_arm64 wheels only (no sdist), so this extra needs
+# macOS 15 (Sequoia) or later: on macOS 13/14 pip finds no matching distribution. Alternatives
+# there: conda-forge's build (`conda install -c conda-forge pyrealsense2`; macOS 11+, Apple Silicon
+# and Intel, Python 3.11-3.14), or `pip install pyrealsense2-macosx==2.54.2` (macOS 12+ universal2
+# wheels, Python <= 3.12 only; it records ROS1 .bag files, which the readers handle).
 realsense = [
     "pyrealsense2>=2.56; sys_platform != 'darwin'",
     "pyrealsense2-macosx>=2.56; sys_platform == 'darwin' and platform_machine == 'arm64'",

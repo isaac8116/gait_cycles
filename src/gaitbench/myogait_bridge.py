@@ -4,7 +4,8 @@ myogait (pinned 0.9.1) works on a "pivot" dict: ``meta`` (fps, frame size),
 an ``extraction`` block naming the pose model, and a ``frames`` list where
 each frame holds ``frame_idx``, ``time_s`` and ``landmarks`` as
 ``{NAME: {"x", "y", "visibility"}}`` with x and y **normalised** by the frame
-width and height. This module converts between that pivot and
+width and height (the bridge's own pivots use one length for both axes; see
+"Square pivot" below). This module converts between that pivot and
 :class:`~gaitbench.formats.Keypoints`, and runs myogait's validated
 processing chain (``run_pipeline``: Butterworth filter, angles, sign
 canonicalisation, event detection, cycle segmentation, direction filter) so
@@ -12,12 +13,38 @@ that the events scored by the harness are exactly what myogait would report.
 
 Things this module takes care of, found by reading myogait 0.9.1:
 
-* **Frame numbering.** ``detect_events`` maps detector output from array
-  positions to ``frame_idx`` (fixed in myogait 0.8.3), but
-  ``event_consensus`` does not: its frames are array positions. The bridge
-  runs consensus on a positional view of the frames and maps the result to
-  source frame indices itself, so every events table uses source-video frame
-  indices whatever the method.
+* **Frame numbering.** ``event_consensus`` returns array positions, not
+  ``frame_idx``, and myogait's cycle code assumes contiguous frames
+  (``duration = (end_frame - start_frame) / fps``), so on a decimated copy
+  (``frame_idx`` 0, 4, 8 ... at 60 fps) every cycle came out 4x too long and
+  was rejected. The bridge therefore runs every method on a positional view
+  (``frame_idx`` 0..N-1, ``fps`` the rate actually sampled, as myogait would
+  see a genuinely lower-rate video) and maps event frames and cycle
+  start/end/toe-off frames back to source indices itself; event ``time`` is
+  taken from ``kp.time_s``. Every result uses source-video frame indices
+  whatever the method.
+* **Square pivot (myogait 0.9.1 bug).** On a non-square frame
+  ``compute_angles`` converts landmarks to pixels before computing angles,
+  so the hip/knee/ankle positions it hands to gaitkit are in pixels, while
+  ``_convert_to_gaitkit_frames`` adds heel and toe from the raw frames in
+  normalised units and treats everything as normalised. The leg ends up
+  about 2000 times larger than the foot and gk_bike, gk_ensemble,
+  gk_vancanneyt and gk_dgei return nonsense on any non-square clip.
+  :func:`keypoints_to_pivot` therefore divides both axes by one length,
+  ``L = max(width, height)``, and writes the pivot frame as ``L x L``: that
+  conversion step never runs and angles stay metrically correct. The true
+  frame size is kept in ``extraction['gaitbench']['meta']`` and restored by
+  :func:`pivot_to_keypoints`. myogait's own methods give the same events
+  either way.
+* **Leg gaps.** gaitkit's BayesianBis (``gk_bike``, and any consensus that
+  includes it) reads hip, knee and ankle in every frame and raises
+  ``KeyError`` (or ``AttributeError`` for a frame with nothing detected)
+  when one is missing, and myogait's ``normalize`` bridges only gaps of up
+  to 10 samples. A 46 ms gap would crash a 240 fps clip but not its 60 fps
+  copy. Before handing keypoints to myogait, the bridge fills NaN runs in
+  HIP/KNEE/ANKLE (linear in time inside the clip, nearest value held at
+  the ends, confidence 0) on its own copy and lists the filled points in
+  ``df.attrs['myogait']['filled_points']``.
 * **Missing points** are written the way ``myogait.extract`` writes them: a
   frame with no detected point has ``landmarks == {}``; a single missing
   point is ``{"x": nan, "y": nan, "visibility": 0.0}``.
@@ -66,13 +93,45 @@ from typing import Any, Iterator, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from .formats import CANONICAL_KEYPOINTS, FormatError, Keypoints, frames_to_times, make_events
+from .formats import CANONICAL_KEYPOINTS, SIDE_PREFIX, FormatError, Keypoints, frames_to_times, make_events
 
 logger = logging.getLogger(__name__)
 
 CONSENSUS = "consensus"
-# Default consensus members, chosen by the evaluation plan (E2).
-DEFAULT_CONSENSUS_METHODS: tuple[str, ...] = ("zeni", "gk_bike", "gk_zeni", "gk_oconnor")
+# Default consensus members: the methods with the best worst-case recall over
+# fixed and panning cameras. Measured with myogait 0.9.1 / gaitkit 1.4.9 after
+# the square-pivot, leg-gap and positional-frame fixes: synthetic walks (5 s,
+# 1920x1080, 2 px noise, 3 seeds x both directions, pan = camera following at
+# 1.3 m/s), recall within 2 frames of the clip's own rate, mean of 6 walks:
+#
+#   method            fixed60 fixed240 pan60 pan240 worst precision
+#   zeni                0.95    0.95    0.95  0.95   0.95   1.00
+#   oconnor             0.95    0.95    0.95  0.95   0.95   1.00
+#   gk_zeni             0.95    0.95    0.47  0.47   0.47   0.75
+#   gk_hreljac          0.44    0.37    0.44  0.37   0.37   0.15
+#   gk_mickelborough    0.07    0.02    0.07  0.02   0.02   0.03
+#   gk_bike             0.95    0.01    0.47  0.00   0.00   0.38
+#   gk_ensemble         0.95    0.03    0.47  0.00   0.00   0.38
+#   gk_vancanneyt       0.74    0.00    0.00  0.00   0.00   0.50
+#   gk_dgei             0.40    0.00    0.40  0.00   0.00   0.21
+#   gk_oconnor          0.11    0.00    0.11  0.00   0.00   0.02
+#   gk_ghoussayni       0.04    0.00    0.04  0.00   0.00   0.01
+#   velocity            0.02    0.00    0.02  0.00   0.00   0.01
+#   crossing            0.00    0.00    0.00  0.00   0.00   0.00
+#   consensus, these 3  0.95    0.95    0.95  0.95   0.95   1.00
+#   consensus, old 4    0.95    0.95    0.63  0.47   0.47   0.78
+#   (old: zeni, gk_bike, gk_zeni, gk_oconnor)
+#
+# gk_zeni swaps HS and TO on most panning walks (gaitkit's walking-direction
+# fallback, an upstream bug), and so do gk_bike and gk_ensemble, which on this
+# walker also lag by 12-20 ms (3-5 frames at 240 fps). gk_hreljac, fourth by
+# worst case, is left out: precision 0.15, and adding it lowers the
+# consensus's precision to 0.93 with no gain in recall. On a fixed camera
+# gk_zeni gives zeni's events, so the consensus follows zeni there; on a pan
+# where gk_zeni flips, an event needs zeni and oconnor to agree.
+# gk_intellevent and gk_deepevent were not measured (onnxruntime and
+# tensorflow are not installed). Synthetic walker: says nothing about real people.
+DEFAULT_CONSENSUS_METHODS: tuple[str, ...] = ("zeni", "oconnor", "gk_zeni")
 
 _EVENT_KEYS: dict[str, tuple[str, str]] = {
     "left_hs": ("L", "HS"),
@@ -105,6 +164,8 @@ _MODEL_PACKAGES: dict[str, str] = {
 _ESTIMATED_FOOT_VISIBILITY = 0.5
 _ESTIMATED_FOOT_PARTS = ("HEEL", "FOOT_INDEX")
 _CAPTURED_LOGGERS = ("myogait", "gaitkit")
+# Points gaitkit reads in every frame (see "Leg gaps" in the module docstring).
+_LEG_POINTS = tuple(p + part for p in SIDE_PREFIX.values() for part in ("HIP", "KNEE", "ANKLE"))
 
 
 class MissingDependencyError(RuntimeError, ImportError):
@@ -169,22 +230,27 @@ def keypoints_to_pivot(kp: Keypoints, *, derive_foot_index: bool = True) -> dict
     ``myogait.schema.create_empty``, an ``extraction`` block naming the
     backend as the model, and one entry in ``frames`` per keypoint frame with
     ``frame_idx`` (source-video index), ``time_s``, ``confidence`` (mean
-    visibility of the points present) and ``landmarks``. Coordinates are
-    divided by the frame width and height. All 33 MediaPipe names are
-    written (NaN where the backend has no such point, as ``extract`` does for
-    COCO models); ``LEFT_BIG_TOE`` and the other extended foot names are
-    written only if the keypoints have them.
+    visibility of the points present) and ``landmarks``. Unlike ``extract``,
+    both coordinates are divided by one length ``L = max(width, height)``
+    and ``meta`` gives the frame as ``L x L``, which works around a
+    myogait 0.9.1 aspect-ratio bug (see the module docstring); the true size
+    is kept under ``extraction['gaitbench']['meta']``. ``meta['fps']`` is
+    the rate actually sampled (:attr:`~gaitbench.formats.Keypoints.rate`).
+    All 33 MediaPipe names are written (NaN where the backend has no such
+    point, as ``extract`` does for COCO models); ``LEFT_BIG_TOE`` and the
+    other extended foot names are written only if the keypoints have them.
 
     Parameters
     ----------
     kp:
         Keypoints with ``meta['width']`` and ``meta['height']`` set.
     derive_foot_index:
-        If the keypoints have toe points but no ``*_FOOT_INDEX`` (OpenPose,
-        RTMW), write ``FOOT_INDEX`` as the mean of the available toes, as
-        ``extract`` does for RTMW and Sapiens. gaitkit methods use
-        ``FOOT_INDEX`` as the toe marker. :func:`pivot_to_keypoints` drops
-        derived points again.
+        If the keypoints have both toe points but no ``*_FOOT_INDEX``
+        (OpenPose, RTMW), write ``FOOT_INDEX`` as the midpoint of
+        ``BIG_TOE`` and ``SMALL_TOE`` (confidence the lower of the two) in
+        the frames where both are present, and NaN elsewhere, as ``extract``
+        does for RTMW and Sapiens. gaitkit methods use ``FOOT_INDEX`` as the
+        toe marker. :func:`pivot_to_keypoints` drops derived points again.
 
     Returns
     -------
@@ -199,31 +265,29 @@ def keypoints_to_pivot(kp: Keypoints, *, derive_foot_index: bool = True) -> dict
     from myogait.schema import create_empty
 
     width, height = _frame_size(kp.meta, what=f"keypoints {kp.clip_id!r}")
+    side = max(width, height)  # one length for both axes: see "Square pivot" in the module docstring
     backend = str(kp.meta.get("backend", "") or "unknown")
 
-    xy = kp.xy.copy()
     conf = np.clip(np.nan_to_num(kp.conf, nan=0.0), 0.0, 1.0)
-    missing = np.isnan(xy).any(axis=2)
-    norm = np.empty_like(xy)
-    norm[..., 0] = xy[..., 0] / width
-    norm[..., 1] = xy[..., 1] / height
+    missing = np.isnan(kp.xy).any(axis=2)
+    norm = kp.xy / side
 
     names = list(kp.names)
     derived: list[str] = []
     if derive_foot_index:
         for prefix in ("LEFT_", "RIGHT_"):
             target = prefix + "FOOT_INDEX"
-            toes = [j for j, n in enumerate(names) if n in (prefix + "BIG_TOE", prefix + "SMALL_TOE")]
-            if target in names or not toes:
+            big, small = prefix + "BIG_TOE", prefix + "SMALL_TOE"
+            if target in names or big not in names or small not in names:
                 continue
-            toe_xy = np.where(missing[:, toes, None], np.nan, norm[:, toes, :])
-            with np.errstate(invalid="ignore"), warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN slices: toe missing in that frame
-                mid = np.nanmean(toe_xy, axis=1)
-            toe_conf = np.where(missing[:, toes], np.inf, conf[:, toes]).min(axis=1)
-            mid_missing = np.isnan(mid).any(axis=1)
+            jb, js = names.index(big), names.index(small)
+            # Only where both toes were seen, as extract does: a single toe would make the
+            # marker jump by half the toe spread; myogait interpolates short gaps instead.
+            mid_missing = missing[:, jb] | missing[:, js]
+            mid = np.where(mid_missing[:, None], np.nan, (norm[:, jb] + norm[:, js]) / 2)
+            mid_conf = np.where(mid_missing, 0.0, np.minimum(conf[:, jb], conf[:, js]))
             norm = np.concatenate([norm, mid[:, None, :]], axis=1)
-            conf = np.concatenate([conf, np.where(mid_missing, 0.0, toe_conf)[:, None]], axis=1)
+            conf = np.concatenate([conf, mid_conf[:, None]], axis=1)
             missing = np.concatenate([missing, mid_missing[:, None]], axis=1)
             names.append(target)
             derived.append(target)
@@ -262,9 +326,9 @@ def keypoints_to_pivot(kp: Keypoints, *, derive_foot_index: bool = True) -> dict
 
     pivot = create_empty(
         video_path=str(kp.meta.get("source", "")),
-        fps=float(kp.fps),
-        width=int(round(width)),
-        height=int(round(height)),
+        fps=float(kp.rate),
+        width=int(round(side)),
+        height=int(round(side)),
         n_frames=kp.n_frames,
     )
     pivot["frames"] = frames
@@ -319,8 +383,10 @@ def pivot_to_keypoints(
         ``frame_idx`` and ``time_s`` from the pivot frames (``frame_idx``
         scaled back to source frames when ``extract`` subsampled with
         ``experimental={'target_fps': ...}``). ``meta`` holds fps, width,
-        height, source, backend, ``tool='myogait'``, tool_version, model,
-        model_detail and a ``myogait_extraction`` summary.
+        height (for a pivot from :func:`keypoints_to_pivot`, the original
+        keypoints' values, not the square pivot frame), source, backend,
+        ``tool='myogait'``, tool_version, model, model_detail and a
+        ``myogait_extraction`` summary.
     """
     frames = list(pivot.get("frames") or [])
     if not frames:
@@ -410,6 +476,9 @@ def pivot_to_keypoints(
             "myogait_estimated_foot_points_dropped": n_dropped,
         }
     )
+    # keypoints_to_pivot writes an L x L frame at the sampled rate; give back the clip's own values.
+    stored_meta = stored.get("meta") or {}
+    meta.update({k: stored_meta[k] for k in ("fps", "width", "height") if stored_meta.get(k)})
     if meta["fps"] is None:
         del meta["fps"]
     return Keypoints(
@@ -441,8 +510,9 @@ def run_myogait(
 ) -> dict:
     """Run myogait's validated pipeline on keypoints and return its raw result.
 
-    For a single method this is ``myogait.pipeline.run_pipeline`` on
-    :func:`keypoints_to_pivot` of ``kp`` with ``analyze=False``. For
+    For a single method this is ``myogait.pipeline.run_pipeline`` with
+    ``analyze=False`` on :func:`keypoints_to_pivot` of ``kp`` (leg gaps
+    filled, frames numbered 0..N-1; see the module docstring). For
     ``method='consensus'`` the same steps run (normalize, compute_angles,
     canonicalize_angle_signs), then ``event_consensus``, then cycle
     segmentation, the direction filter and myogait's quality diagnostics on
@@ -465,9 +535,11 @@ def run_myogait(
     -------
     dict
         ``{"data", "cycles", "stats", "quality", "source_type"}`` as from
-        ``run_pipeline``. Event and cycle frames (``data['events']``,
-        ``cycles['cycles'][i]['start_frame']`` ...) are source-video frame
-        indices for every method, consensus included.
+        ``run_pipeline``. Frame numbers (``data['frames']``, event frames in
+        ``data['events']``, ``cycles['cycles'][i]['start_frame']``,
+        ``end_frame`` and ``toe_off_frame``) are source-video frame indices
+        for every method, consensus included, and event ``time`` is the
+        frame's ``kp.time_s``.
 
     Raises
     ------
@@ -527,8 +599,10 @@ consensus_methods, consensus_tolerance_frames:
         index, ``time_s`` from :func:`~gaitbench.formats.frames_to_times` and
         ``confidence`` as myogait reports it (prominence ratio for the
         native methods, the vote fraction for consensus).
-        ``df.attrs['myogait']`` holds myogait's quality report, its captured
-        log messages and any Python warnings raised during the run.
+        ``df.attrs['myogait']`` holds myogait's quality report, the cycle
+        count, its captured log messages, any Python warnings raised during
+        the run and ``filled_points`` (frames filled per hip/knee/ankle
+        point before the run, see the module docstring).
 
     Raises
     ------
@@ -800,7 +874,8 @@ def _run(
                 raise ValueError("'consensus' cannot be a member of itself")
             _check_method(m)
 
-    pivot = keypoints_to_pivot(kp)
+    filled_kp, filled = _fill_leg_gaps(kp)
+    pivot = _positional_view(keypoints_to_pivot(filled_kp))
     with _captured_output() as captured, _gaitkit_auto_install_off():
         try:
             if method == CONSENSUS:
@@ -832,6 +907,8 @@ def _run(
             raise MyogaitRunError(
                 f"myogait method {method!r} failed on clip {kp.clip_id!r}: {type(exc).__name__}: {exc}"
             ) from exc
+    _to_source_frames(result, kp)
+    captured["filled_points"] = filled
 
     quality = result.get("quality") or {}
     logger.info(
@@ -859,6 +936,8 @@ def _run_consensus(
 
     Mirrors ``myogait.pipeline._run_steps`` of myogait 0.9.1 for a non-C3D
     source, using only public functions plus the optional ``_diagnose``.
+    ``pivot`` must be a positional view (``frame_idx`` 0..N-1), because
+    ``event_consensus`` returns array positions.
     """
     from myogait.angles import canonicalize_angle_signs, compute_angles
     from myogait.cycles import segment_cycles
@@ -869,29 +948,12 @@ def _run_consensus(
     data = normalize(pivot, filters=["butterworth"], butterworth_cutoff=butterworth_cutoff)
     data = compute_angles(data, calibrate=False)
     data = canonicalize_angle_signs(data)
-
-    # event_consensus returns array positions (it skips the frame_idx remap that
-    # detect_events does). Run it where position == frame_idx, then map back.
-    view = _positional_view(data)
-    event_consensus(
-        view,
+    data = event_consensus(
+        data,
         methods=list(methods),
         tolerance=tolerance,
         min_cycle_duration=min(0.6, min_cycle_duration_s),  # what run_pipeline passes to detect_events
     )
-    events = dict(view["events"])
-    source_idx = [int(f.get("frame_idx", i)) for i, f in enumerate(data["frames"])]
-    fps = float(events.get("fps") or data["meta"].get("fps") or 30.0)
-    for key in _EVENT_KEYS:
-        mapped = []
-        for ev in events.get(key, []) or []:
-            pos = int(ev["frame"])
-            if not 0 <= pos < len(source_idx):
-                logger.warning("consensus event at position %d is outside the %d frames; dropped", pos, len(source_idx))
-                continue
-            mapped.append({**ev, "frame": source_idx[pos], "time": round(source_idx[pos] / fps, 4)})
-        events[key] = mapped
-    data["events"] = events
 
     cycles_all = segment_cycles(
         data, n_points=101, min_duration=min_cycle_duration_s, max_duration=max_cycle_duration_s
@@ -918,6 +980,76 @@ def _positional_view(data: dict) -> dict:
     if isinstance(angles, dict) and len(angles.get("frames") or []) == len(data["frames"]):
         view["angles"] = {**angles, "frames": [{**af, "frame_idx": i} for i, af in enumerate(angles["frames"])]}
     return view
+
+
+def _to_source_frames(result: dict, kp: Keypoints) -> None:
+    """Map a result computed on :func:`_positional_view` back to ``kp``'s source frames, in place.
+
+    Renumbers the frames and angle frames, event ``frame`` (with ``time``
+    from ``kp.time_s``, which is right for variable-frame-rate video where
+    ``position / fps`` is not) and cycle start, end and toe-off frames.
+    """
+    src, n = kp.frame_idx, kp.n_frames
+    data = result.get("data") or {}
+    for frames in (data.get("frames"), data.get("frames_raw"), (data.get("angles") or {}).get("frames")):
+        if not frames:
+            continue
+        if len(frames) != n:
+            logger.warning("myogait returned %d frames for %d keypoint frames; frame_idx left as positions", len(frames), n)
+            continue
+        for i, f in enumerate(frames):
+            f["frame_idx"] = int(src[i])
+
+    events = data.get("events") or {}
+    for key in _EVENT_KEYS:
+        if key not in events:
+            continue
+        mapped = []
+        for ev in events[key] or []:
+            pos = int(ev["frame"])
+            if not 0 <= pos < n:
+                logger.warning("myogait event at position %d is outside the %d frames; dropped", pos, n)
+                continue
+            mapped.append({**ev, "frame": int(src[pos]), "time": float(kp.time_s[pos])})
+        events[key] = mapped
+
+    for cycle in (result.get("cycles") or {}).get("cycles") or []:
+        for key in ("start_frame", "end_frame", "toe_off_frame"):
+            pos = cycle.get(key)
+            if pos is not None and 0 <= int(pos) < n:
+                cycle[key] = int(src[int(pos)])
+
+
+def _fill_leg_gaps(kp: Keypoints) -> tuple[Keypoints, dict[str, int]]:
+    """Copy of ``kp`` with NaN runs in hip, knee and ankle filled, for myogait only.
+
+    See "Leg gaps" in the module docstring. Gaps are interpolated linearly
+    in time and the nearest value is held before the first and after the
+    last detection; filled points keep confidence 0. A point that is never
+    detected is left alone.
+
+    Returns
+    -------
+    (Keypoints, dict)
+        The copy (``kp`` itself if nothing was filled) and the number of
+        frames filled per keypoint name.
+    """
+    xy, conf = kp.xy.copy(), kp.conf.copy()
+    filled: dict[str, int] = {}
+    for name in _LEG_POINTS:
+        if not kp.has(name):
+            continue
+        j = kp.index(name)
+        gap = np.isnan(xy[:, j]).any(axis=1)
+        if not gap.any() or gap.all():
+            continue
+        for c in range(2):
+            xy[gap, j, c] = np.interp(kp.time_s[gap], kp.time_s[~gap], xy[~gap, j, c])
+        conf[gap, j] = 0.0
+        filled[name] = int(gap.sum())
+    if not filled:
+        return kp, filled
+    return Keypoints(kp.clip_id, kp.names, xy, conf, kp.time_s, kp.frame_idx, kp.meta), filled
 
 
 def _events_table(events: Mapping[str, Any], kp: Keypoints, method: str) -> pd.DataFrame:

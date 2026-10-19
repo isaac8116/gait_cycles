@@ -107,6 +107,36 @@ def without(kp: Keypoints, parts: tuple[str, ...]) -> Keypoints:
     return kp.subset([n for n in kp.names if n not in drop])
 
 
+def with_conf(kp: Keypoints, conf: np.ndarray, xy: np.ndarray | None = None) -> Keypoints:
+    return Keypoints(kp.clip_id, kp.names, kp.xy if xy is None else xy, conf, kp.time_s, kp.frame_idx, kp.meta)
+
+
+def held_still(walk, stand_s: float, noise_px: float, seed: int) -> tuple[Keypoints, float, float]:
+    """``walk`` with its first and last frames held for ``stand_s`` each, and jitter on every frame.
+
+    Models a clip in which the walker stands at the start line, walks, then
+    stands again at the end. Returns the keypoints and the times walking
+    starts and stops.
+    """
+    kp = walk.keypoints
+    n_hold = int(round(stand_s * kp.fps))
+    xy = np.concatenate([np.repeat(kp.xy[:1], n_hold, 0), kp.xy, np.repeat(kp.xy[-1:], n_hold, 0)])
+    conf = np.concatenate([np.repeat(kp.conf[:1], n_hold, 0), kp.conf, np.repeat(kp.conf[-1:], n_hold, 0)])
+    xy = xy + np.random.default_rng(seed).normal(0.0, noise_px, xy.shape)
+    n = len(xy)
+    held = Keypoints(kp.clip_id, kp.names, xy, conf, np.arange(n) / kp.fps, np.arange(n), kp.meta)
+    return held, n_hold / kp.fps, (n_hold + kp.n_frames - 1) / kp.fps
+
+
+def event_times(events: pd.DataFrame, side: str, event: str) -> np.ndarray:
+    return events.loc[(events["side"] == side) & (events["event"] == event), "time_s"].to_numpy()
+
+
+def has_event_near(events: pd.DataFrame, side: str, event: str, time_s: float, tol_s: float) -> bool:
+    times = event_times(events, side, event)
+    return bool(times.size) and float(np.abs(times - time_s).min()) <= tol_s
+
+
 # ---------------------------------------------------------------------------
 # accuracy on the synthetic walker
 # ---------------------------------------------------------------------------
@@ -131,15 +161,123 @@ def test_clean_walk_every_event_found(detector, pan, direction, fps):
     assert events["time_s"].between(kp.time_s[0], kp.time_s[-1]).all()
 
 
-@pytest.mark.parametrize("detector", DETECTORS)
-@pytest.mark.parametrize("fps", [60, 30])
-def test_events_near_clip_edges_are_found(detector, fps):
-    # Shift the gait phase so events land in the first and last few frames.
-    for phase in np.linspace(0.0, 1.0, 21):
-        walk = simulate_walk(fps=fps, right_phase0=float(phase))
-        result = match(run_detector(detector, walk.keypoints), visible_truth(walk), fps)
-        assert result["missed"] == [], f"phase {phase:.2f}"
-        assert result["extra"] == [], f"phase {phase:.2f}"
+@pytest.mark.parametrize("fps", [25, 30, 60, 240])
+def test_events_near_clip_edges_are_found(fps):
+    """The documented edge limit holds at every gait phase, not just on a lucky grid.
+
+    A dense phase grid moves events through the first and last few frames.
+    Near an edge only part of a peak is visible, so an event within about
+    50 ms of it may be missed (rarely one just past EDGE_RELAX_MAX_S), but
+    none further in, nothing spurious appears, and most events within 0.1 s
+    of an edge are still found.
+    """
+    tol_frames = max(2.0, 0.02 * fps)  # two frames is only 8 ms at 240 fps
+    limit_s = base.EDGE_RELAX_MAX_S + 0.03
+    n_near = n_near_found = 0
+    for phase in np.linspace(0.0, 1.0, 51):
+        walk = simulate_walk(fps=fps, duration_s=2.5, right_phase0=float(phase))
+        kp, truth = walk.keypoints, visible_truth(walk)
+        near = truth[np.minimum(truth["time_s"] - kp.time_s[0], kp.time_s[-1] - truth["time_s"]) < 0.1]
+        for detector in DETECTORS:
+            events = run_detector(detector, kp)
+            result = match(events, truth, fps, tol_frames=tol_frames)
+            assert result["extra"] == [], f"{detector} phase {phase:.2f}"
+            for side, event, t in result["missed"]:
+                assert min(t - kp.time_s[0], kp.time_s[-1] - t) < limit_s, f"{detector} phase {phase:.2f}: {side} {event} {t}"
+            n_near += len(near)
+            n_near_found += sum(has_event_near(events, r.side, r.event, r.time_s, tol_frames / fps) for r in near.itertuples())
+    assert n_near_found >= 0.5 * n_near
+
+
+@pytest.mark.parametrize(
+    ("fps", "phase", "side", "event"),
+    [(25, 0.225, "L", "HS"), (25, 0.325, "R", "TO"), (30, 0.2, "L", "HS"), (30, 0.3, "R", "TO")],
+)
+def test_events_one_or_two_frames_from_the_end_are_found(fps, phase, side, event, monkeypatch):
+    walk = simulate_walk(fps=fps, duration_s=2.5, right_phase0=phase)
+    kp = walk.keypoints
+    t_true = float(event_times(walk.truth, side, event).max())
+    assert 1.0 < (kp.time_s[-1] - t_true) * fps <= 2.0
+
+    def found() -> bool:
+        return all(has_event_near(run_detector(d, kp), side, event, t_true, 1.0 / fps) for d in DETECTORS)
+
+    assert found()
+    # Only the edge relaxation can see it: the full prominence is not visible yet.
+    monkeypatch.setattr(base, "EDGE_PROMINENCE_FRACTION", 1.0)
+    assert not found()
+
+
+def test_filter_padding_is_long_enough_at_240fps():
+    # Review case: with a fixed 15-sample pad (62 ms at 240 fps) the filter
+    # flattened the end of the clip and this R HS, 9 frames from the end, was lost.
+    walk = simulate_walk(fps=240, duration_s=4.0, right_phase0=0.23)
+    t_true = float(event_times(walk.truth, "R", "HS").max())
+    assert (walk.keypoints.time_s[-1] - t_true) * 240 == pytest.approx(9.0, abs=0.1)
+    for detector in DETECTORS:
+        assert has_event_near(run_detector(detector, walk.keypoints), "R", "HS", t_true, 0.02)
+    # Filtering only part of a walk gives nearly the full-signal result up to
+    # the segment's end, at 240 fps as at 60 fps.
+    for fps in (60, 240):
+        sig = base.foot_signals(simulate_walk(fps=fps, duration_s=6.0, pan_speed_mps=SPEED).keypoints, "heel", direction=1)["L"]
+        worst = []
+        for end_s in np.linspace(2.0, 3.0, 21):
+            stop, last = int(round(end_s * fps)), int(round(0.05 * fps))
+            part = base.lowpass(sig.raw[:stop], fps, sig.cutoff_hz)
+            worst.append(np.abs(part[-last:] - sig.smooth[stop - last : stop]).max())
+        assert np.median(worst) < 1.0, fps
+
+
+@pytest.mark.parametrize("fps", [60, 240])
+def test_standing_still_at_the_clip_ends_gives_no_events(fps):
+    # iPhone-scale moving-camera clip: stand 1.5 s at the start line, walk 4 s,
+    # stand 1.5 s, with 5 px pose jitter on every frame.
+    for seed in range(6):
+        for direction in (1, -1):
+            walk = simulate_walk(
+                fps=fps, duration_s=4.0, direction=direction, pan_speed_mps=SPEED, px_per_m=427,
+                right_phase0=(seed * 0.173) % 1,
+            )
+            held, start, stop = held_still(walk, stand_s=1.5, noise_px=5.0, seed=seed)
+            for detector in DETECTORS:
+                t = run_detector(detector, held)["time_s"]
+                assert t.between(start - 0.15, stop + 0.15).all(), f"{detector} seed {seed} dir {direction}: {t.tolist()}"
+
+
+def test_review_case_no_heel_strike_while_standing():
+    # 60 fps, 3 px jitter: zeni reported a left HS 0.7 s into the standing
+    # start, from a noise bump 43 frames from the clip start.
+    walk = simulate_walk(fps=60, duration_s=4.0, direction=-1, pan_speed_mps=SPEED, right_phase0=(3 * 0.173) % 1)
+    held, start, stop = held_still(walk, stand_s=1.0, noise_px=3.0, seed=3)
+    for detector in DETECTORS:
+        t = run_detector(detector, held)["time_s"]
+        assert t.between(start - 0.15, stop + 0.15).all(), detector
+
+
+@pytest.mark.parametrize("fps", [60, 240])
+def test_noisy_gap_edges_give_no_spurious_events(fps):
+    # Six 0.12-0.4 s occlusions of one foot, 5 px jitter at 125 px/m (about
+    # 8 % of the foot signal's range).
+    for seed in range(6):
+        for direction in (1, -1):
+            walk = simulate_walk(
+                fps=fps, duration_s=8.0, direction=direction, pan_speed_mps=SPEED, px_per_m=125, width=562,
+                height=316, right_phase0=(seed * 0.173) % 1, noise_px=5.0, seed=seed,
+            )
+            kp = walk.keypoints
+            rng = np.random.default_rng(1000 + seed)
+            xy, conf = kp.xy.copy(), kp.conf.copy()
+            for _ in range(6):
+                length = int(round(rng.uniform(0.12, 0.4) * fps))
+                begin = int(rng.integers(int(0.5 * fps), kp.n_frames - length - int(0.5 * fps)))
+                prefix = "LEFT_" if rng.random() < 0.5 else "RIGHT_"
+                for part in ("HEEL", "ANKLE", "FOOT_INDEX", "BIG_TOE", "SMALL_TOE"):
+                    xy[begin : begin + length, kp.index(prefix + part)] = np.nan
+                    conf[begin : begin + length, kp.index(prefix + part)] = 0.0
+            gappy = with_conf(kp, conf, xy)
+            for detector in DETECTORS:
+                result = match(run_detector(detector, gappy), walk.truth, fps, tol_frames=0.1 * fps)
+                assert result["extra"] == [], f"{detector} seed {seed} dir {direction}"
 
 
 @pytest.mark.parametrize("fps", [60, 30])
@@ -222,7 +360,7 @@ def test_keypoints_from_every_second_frame_report_source_frames():
         frame_idx=kp.frame_idx[::2],
         meta=kp.meta,
     )
-    assert base.sample_rate(half) == pytest.approx(60.0)
+    assert half.rate == pytest.approx(60.0)
     events = run_detector("zeni", half)
     truth = visible_truth(walk)
     result = match(events, truth, fps=120, tol_frames=4.0)  # 4 source frames = 2 sampled frames
@@ -235,24 +373,83 @@ def test_keypoints_from_every_second_frame_report_source_frames():
     assert np.abs(merged["frame"] - merged["frame_truth"]).max() <= 2
 
 
+def test_detectors_use_the_mean_frame_rate():
+    # iPhone 240 fps stored in a 1/600 s time base: frame intervals alternate
+    # 3 and 2 ticks, so the median interval reads 200 fps; the mean is 240.
+    kp = simulate_walk(fps=240, duration_s=3.0).keypoints
+    ticks = np.concatenate([[0], np.cumsum(np.resize([3, 2], kp.n_frames - 1))])
+    kp = Keypoints(kp.clip_id, kp.names, kp.xy, kp.conf, ticks / 600.0, kp.frame_idx, kp.meta)
+    assert 1.0 / np.median(np.diff(kp.time_s)) == pytest.approx(200.0)
+    assert kp.rate == 240.0
+    # A 23-frame (96 ms) heel gap is within max_gap_s = 0.1 s at 240 fps, so it
+    # is filled; at the median's 200 fps it would have split the signal.
+    conf, xy = kp.conf.copy(), kp.xy.copy()
+    conf[300:323, kp.index("LEFT_HEEL")] = 0.0
+    xy[300:323, kp.index("LEFT_HEEL")] = np.nan
+    sig = base.foot_signals(with_conf(kp, conf, xy), "heel", direction=1)["L"]
+    assert np.isfinite(sig.raw[300:323]).all()
+    assert len(sig.segments) == 1
+
+
 def test_missing_heel_falls_back_to_ankle():
-    walk = simulate_walk(fps=60, pan_speed_mps=SPEED)
+    # With a heel rise the heel and ankle signals differ in late stance, so
+    # this checks the ankle is really what gets used.
+    walk = simulate_walk(fps=60, pan_speed_mps=SPEED, heel_off_frac=0.65)
     kp = without(walk.keypoints, ("HEEL",))
     assert base.choose_foot_point(kp, "L", "heel") == "LEFT_ANKLE"
     signals = base.foot_signals(kp, "heel", direction=1)
     assert {s.point for s in signals.values()} == {"LEFT_ANKLE", "RIGHT_ANKLE"}
+    ankle = base.foot_signals(walk.keypoints, "ankle", direction=1)
+    heel = base.foot_signals(walk.keypoints, "heel", direction=1)
+    for side in ("L", "R"):
+        np.testing.assert_allclose(signals[side].raw, ankle[side].raw)
+        offset = signals[side].raw - heel[side].raw
+        assert np.nanmax(offset) - np.nanmin(offset) > 5.0  # px; constant for a rigid foot
     result = match(run_detector("zeni", kp), visible_truth(walk), 60)
     assert result["missed"] == [] and result["extra"] == []
 
 
 def test_missing_toes_fall_back_to_ankle():
-    walk = simulate_walk(fps=60)
+    # With a heel rise the ankle is furthest back before the toe lifts, so toe
+    # offs from the ankle fallback come early: that is how we know it is used.
+    walk = simulate_walk(fps=60, heel_off_frac=0.65)
+    with_toes = run_detector("zeni", walk.keypoints)
     kp = without(walk.keypoints, ("FOOT_INDEX",))
     assert base.choose_foot_point(kp, "R", "toe") == "RIGHT_BIG_TOE"
     kp = without(kp, ("BIG_TOE",))
     assert base.choose_foot_point(kp, "R", "toe") == "RIGHT_ANKLE"
-    result = match(run_detector("zeni", kp), visible_truth(walk), 60)
+    events = run_detector("zeni", kp)
+    result = match(events, visible_truth(walk), 60)
     assert result["missed"] == []
+    stenum = run_detector("stenum", walk.keypoints)
+    for side in ("L", "R"):
+        early = event_times(events, side, "TO") - event_times(with_toes, side, "TO")
+        assert (early < -0.01).all() and (early > -0.04).all()
+        np.testing.assert_allclose(event_times(events, side, "TO"), event_times(stenum, side, "TO"))
+        np.testing.assert_allclose(event_times(events, side, "HS"), event_times(with_toes, side, "HS"))
+
+
+def test_heel_rise_lets_zeni_and_stenum_differ():
+    rigid = simulate_walk(fps=60)
+    walk = simulate_walk(fps=60, heel_off_frac=0.65)
+    pd.testing.assert_frame_equal(walk.truth, rigid.truth)  # same events, different feet
+
+    def spread_m(w, a: str, b: str) -> float:
+        """How much the x distance between two points of the left foot varies, in metres."""
+        names = w.keypoints.names
+        return float(np.ptp(w.world_xy[:, names.index("LEFT_" + a), 0] - w.world_xy[:, names.index("LEFT_" + b), 0]))
+
+    assert spread_m(rigid, "FOOT_INDEX", "HEEL") < 1e-9 and spread_m(rigid, "ANKLE", "HEEL") < 1e-9
+    assert spread_m(walk, "FOOT_INDEX", "HEEL") > 0.03 and spread_m(walk, "ANKLE", "HEEL") > 0.03
+    kp = walk.keypoints
+    zeni, stenum = run_detector("zeni", kp), run_detector("stenum", kp)
+    truth = visible_truth(walk)
+    for events in (zeni, stenum):
+        result = match(events, truth, 60)
+        assert result["missed"] == [] and result["extra"] == []
+    for side in ("L", "R"):
+        np.testing.assert_allclose(event_times(stenum, side, "HS"), event_times(zeni, side, "HS"), atol=1e-3)
+        assert (event_times(stenum, side, "TO") - event_times(zeni, side, "TO") < -0.01).all()
 
 
 def test_zero_confidence_heel_is_skipped():
@@ -266,12 +463,50 @@ def test_zero_confidence_heel_is_skipped():
 
 
 def test_one_hip_is_enough_for_the_pelvis():
-    kp = simulate_walk().keypoints
-    both = base.pelvis_x(kp)
-    left_only = base.pelvis_x(without(kp, ("RIGHT_HIP",)))
-    np.testing.assert_allclose(left_only, both)
+    # Hips apart as in a real side view, so one hip is not the mid-hip point.
+    walk = simulate_walk(hip_offset_m=0.1)
+    kp = walk.keypoints
+    left_x = kp.point("LEFT_HIP")[:, 0]
+    assert np.nanmax(np.abs(left_x - base.pelvis_x(kp))) > 5.0
+    left_only = without(kp, ("RIGHT_HIP",))
+    np.testing.assert_allclose(base.pelvis_x(left_only), left_x)
+    # A hip slot that is never confident is dropped for the whole clip.
+    conf = kp.conf.copy()
+    conf[:, kp.index("RIGHT_HIP")] = 0.0
+    np.testing.assert_allclose(base.pelvis_x(with_conf(kp, conf)), left_x)
+    # Half the hip offset changes only slowly, so the events stay put.
+    for detector in DETECTORS:
+        result = match(run_detector(detector, left_only), visible_truth(walk), 60)
+        assert result["missed"] == [] and result["extra"] == []
     with pytest.raises(ValueError, match="HIP"):
         base.pelvis_x(without(kp, ("HIP",)))
+
+
+def test_single_hip_frames_do_not_step_the_pelvis():
+    # Perspective puts the hips ~20 px apart at the image edges, in opposite
+    # directions. Using the one visible hip on a frame would step the pelvis by
+    # half of that; each hip must instead be filled across its own short gaps.
+    walk = simulate_walk(fps=60, hip_offset_m=0.1)
+    kp = walk.keypoints
+    gap = kp.point("LEFT_HIP")[:, 0] - kp.point("RIGHT_HIP")[:, 0]
+    assert np.nanmax(gap) > 15.0 and np.nanmin(gap) < -15.0
+    j = kp.index("LEFT_HIP")
+    short = kp.conf.copy()
+    for begin in range(10, kp.n_frames - 30, 23):  # 1-20 frame dropouts, all within PELVIS_MAX_GAP_S
+        short[begin : begin + 1 + begin % 20, j] = 0.0
+    both = base.pelvis_x(kp)
+    filled = base.pelvis_x(with_conf(kp, short))
+    np.testing.assert_allclose(filled, both, atol=1e-6)
+    for detector in DETECTORS:
+        a, b = run_detector(detector, kp), run_detector(detector, with_conf(kp, short))
+        assert (a[["side", "event", "frame"]].to_numpy() == b[["side", "event", "frame"]].to_numpy()).all()
+        np.testing.assert_allclose(a["time_s"], b["time_s"], atol=1e-6)
+    # Longer than PELVIS_MAX_GAP_S: a missing pelvis, not the right hip alone.
+    long = kp.conf.copy()
+    long[100:160, j] = 0.0
+    pelvis = base.pelvis_x(with_conf(kp, long))
+    assert np.isnan(pelvis[100:160]).all()
+    np.testing.assert_allclose(pelvis[:100], both[:100])
 
 
 def test_long_gap_splits_signal_and_short_gap_is_filled():
@@ -402,11 +637,37 @@ def test_edge_aware_drop_matches_prominence_inside_and_relaxes_at_edges():
     y = np.cumsum(rng.normal(size=300))
     peaks, _ = find_peaks(y)
     prominences = peak_prominences(y, peaks)[0]
-    drops = np.array([base._edge_aware_drop(y, p) for p in peaks])
+    np.testing.assert_allclose([base._edge_aware_drop(y, p, 0) for p in peaks], prominences)
+    drops = np.array([base._edge_aware_drop(y, p, 300) for p in peaks])
     assert (drops >= prominences - 1e-12).all()
     # A peak 2 samples from the end: the edge side counts 1/EDGE_PROMINENCE_FRACTION times.
     y = np.array([0.0, 5.0, 10.0, 9.0, 8.0])
-    assert base._edge_aware_drop(y, 2) == pytest.approx(2.0 / base.EDGE_PROMINENCE_FRACTION)
+    assert base._edge_aware_drop(y, 2, 2) == pytest.approx(2.0 / base.EDGE_PROMINENCE_FRACTION)
+
+
+def test_edge_relaxation_is_near_the_edge_one_sided_and_above_the_noise():
+    frac, margin = base.EDGE_PROMINENCE_FRACTION, base.EDGE_NOISE_MARGIN
+    y = np.array([0.0, 5.0, 10.0, 9.0, 8.0])  # the peak falls by 2 over the last 2 samples
+    assert base._edge_aware_drop(y, 2, 1) == pytest.approx(2.0)  # further from the edge than allowed
+    # The outermost sample is barely filtered: a fall it could explain is not multiplied.
+    assert base._edge_aware_drop(y, 2, 2, noise=0.5) == pytest.approx((2.0 - margin * 0.5) / frac)
+    assert base._edge_aware_drop(y, 2, 2, noise=1.0) == pytest.approx(2.0)
+    # Both sides reach an edge (a short segment): one side may be relaxed, but
+    # the other must then pass on its own fall (5 here, not 4.5 / frac = 18).
+    y = np.array([0.0, 3.0, 5.0, 3.0, 2.0, 0.5])
+    assert base._edge_aware_drop(y, 2, 10) == pytest.approx(5.0)
+    # find_extrema turns EDGE_RELAX_MAX_S into whole frames at the clip's rate:
+    # a peak k samples from the end is relaxed at a rate where k frames fit in
+    # the cap, and not at one where they don't.
+    k = 6
+    assert k / 30.0 <= base.EDGE_RELAX_MAX_S < k / 25.0
+    i = np.arange(120.0)
+    peak = 119 - k
+    # A deep trough on the left; a gentle fall of 3 over the last k samples.
+    y = -np.where(i < peak, peak - i, 0.5 * (i - peak)) - 100.0 * (i < 40)
+    sig = base.FootSignal("L", "LEFT_HEEL", y, y, np.ones(120), [slice(0, 120)])
+    assert len(base.find_extrema(sig, "max", 30.0, prominence_frac=0.04)) == 1
+    assert len(base.find_extrema(sig, "max", 25.0, prominence_frac=0.04)) == 0
 
 
 def test_alternation_drops_weaker_duplicate_only_when_data_is_continuous():

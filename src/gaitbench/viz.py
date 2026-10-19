@@ -252,12 +252,17 @@ def _choose_point(kp: Keypoints, side: str, part: str, min_conf: float) -> str |
 
 
 def _pelvis_x(kp: Keypoints, min_conf: float) -> np.ndarray | None:
-    hips = [kp.masked_point(n, min_conf)[:, 0] for n in ("LEFT_HIP", "RIGHT_HIP") if kp.has(n)]
-    if not hips:
+    """The same pelvis the detectors use, so the plotted signal is the one they saw."""
+    if not (kp.has("LEFT_HIP") or kp.has("RIGHT_HIP")):
         return None
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)  # frames with neither hip
-        return np.nanmean(np.stack(hips), axis=0)
+    try:
+        from .detectors.base import pelvis_x
+    except ImportError:  # plotting must work without the detectors package
+        hips = [kp.masked_point(n, min_conf)[:, 0] for n in ("LEFT_HIP", "RIGHT_HIP") if kp.has(n)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # frames with neither hip
+            return np.nanmean(np.stack(hips), axis=0)
+    return pelvis_x(kp, min_conf)
 
 
 def _for_clip(events: pd.DataFrame, kp: Keypoints) -> pd.DataFrame:

@@ -42,6 +42,8 @@ from ..formats import validate_events
 SOURCE_COLUMNS: tuple[str, ...] = ("tool", "tool_version", "backend", "detector")
 # Events are only ever paired within one of these groups.
 MATCH_KEYS: tuple[str, ...] = ("clip_id", "side", "event")
+# The labelled stretch used by ``restrict_to_truth_span`` is taken per one of these.
+SPAN_KEYS: tuple[str, ...] = ("clip_id", "event")
 
 MATCH_COLUMNS: tuple[str, ...] = (
     "clip_id",
@@ -84,10 +86,15 @@ def match_events(
         (inclusive). The evaluation plan uses 0.1 s.
     restrict_to_truth_span:
         If True, predictions outside ``[first truth time - tolerance, last
-        truth time + tolerance]`` of their clip (over all sides and events) are
-        dropped instead of being counted as FP, because labels may cover only
-        part of a clip. Predictions on clips with no truth at all are then
-        dropped too. If False, every prediction is scored.
+        truth time + tolerance]`` of their clip and event type (both sides
+        together) are dropped instead of being counted as FP, because labels
+        may cover only part of a clip: heel strikes may be labelled
+        throughout and toe offs over part of it or not at all. Predictions of
+        an event type with no truth on their clip, and on clips with no
+        truth at all, are then dropped too. The span is not taken per side:
+        the sides alternate, so one side's first label normally comes half a
+        stride after the other's, and a spurious event in that stretch would
+        go uncounted. If False, every prediction is scored.
 
     Returns
     -------
@@ -108,12 +115,13 @@ def match_events(
     sources = _sources(pred)
 
     if restrict_to_truth_span:
-        span = truth.groupby("clip_id")["time_s"].agg(["min", "max"])
-        lo = pred["clip_id"].map(span["min"]).astype(float) - tolerance_s - TIME_EPS_S
-        hi = pred["clip_id"].map(span["max"]).astype(float) + tolerance_s + TIME_EPS_S
-        # NaN bounds (clip not in truth) make both comparisons False.
-        inside = (pred["time_s"] >= lo) & (pred["time_s"] <= hi)
-        pred = pred.loc[inside.to_numpy()].reset_index(drop=True)
+        span = truth.groupby(list(SPAN_KEYS))["time_s"].agg(["min", "max"])
+        key = pd.MultiIndex.from_frame(pred.loc[:, list(SPAN_KEYS)])
+        lo = span["min"].reindex(key).to_numpy(float) - tolerance_s - TIME_EPS_S
+        hi = span["max"].reindex(key).to_numpy(float) + tolerance_s + TIME_EPS_S
+        # NaN bounds (no truth of that event type on the clip) make both comparisons False.
+        t = pred["time_s"].to_numpy(float)
+        pred = pred.loc[(t >= lo) & (t <= hi)].reset_index(drop=True)
 
     pairs = match_tables(pred, truth, sources, key_cols=MATCH_KEYS, time_col="time_s", tolerance_s=tolerance_s)
     return _matches_frame(pairs, pred, truth)

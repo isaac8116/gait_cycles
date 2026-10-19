@@ -49,6 +49,9 @@ FOOT_POINT_CHAINS: dict[str, tuple[str, ...]] = {
 }
 
 FILTER_ORDER = 4
+# Each end of a segment is padded by this many periods of the cutoff before
+# filtering (0.5 s at 6 Hz), about as long as the filter takes to settle.
+FILTER_PAD_PERIODS = 3.0
 # Upper limit on the cutoff as a fraction of the Nyquist frequency. At 25 fps
 # Nyquist is 12.5 Hz, so a requested 15 Hz cutoff becomes 11.25 Hz.
 MAX_CUTOFF_FRACTION_OF_NYQUIST = 0.9
@@ -59,6 +62,22 @@ _POINT_USABLE_FRACTION = 0.5
 # so that side needs to fall by just this fraction of the usual prominence
 # (see _edge_aware_drop). The other side must still pass in full.
 EDGE_PROMINENCE_FRACTION = 0.25
+# Only peaks this close to the edge are relaxed. A real event further in has
+# fallen far enough by the edge to pass in full (a planted heel moves back
+# relative to the pelvis at walking speed), while relaxing it would let jitter
+# in a standing-still stretch at the start or end of a clip pass as an event.
+# 0.2 s rather than 0.1 s: with the noise margin below, 0.2 s still gave no
+# false events in standing tails or at gap edges, and keeps real clip-edge
+# events at 25 fps that 0.1 s lost (review finding DET-1).
+EDGE_RELAX_MAX_S = 0.2
+# A censored fall ends on the outermost sample of a segment, which zero-phase
+# filtering leaves almost unsmoothed, so its fall is shortened by this many
+# noise standard deviations before it is relaxed (see _edge_aware_drop).
+EDGE_NOISE_MARGIN = 2.0
+# Each hip is interpolated across its own gaps up to this long (see pelvis_x).
+# Longer than a foot's max_gap_s: a foot gap can hide an event, while a hip
+# moves almost linearly over half a second.
+PELVIS_MAX_GAP_S = 0.5
 # Fewest confident frames a direction cue needs before it is trusted.
 _MIN_DIRECTION_FRAMES = 10
 # Share of frames that must agree with the median sign for a cue to count.
@@ -112,22 +131,8 @@ class Extremum:
 # ---------------------------------------------------------------------------
 
 
-def sample_rate(kp: Keypoints) -> float:
-    """Rate at which the keypoint arrays are sampled, in Hz.
-
-    This is ``1 / median(diff(time_s))``, which is not always ``kp.fps``:
-    keypoints extracted from every second frame of a 60 fps video are
-    sampled at 30 Hz, and an iPhone clip's nominal rate may differ slightly
-    from its timestamps. Filters and frame counts must use the real rate.
-    Falls back to ``kp.fps`` for a single frame.
-    """
-    if kp.n_frames > 1:
-        return float(1.0 / np.median(np.diff(kp.time_s)))
-    return kp.fps
-
-
-def pelvis_x(kp: Keypoints, min_conf: float = 0.3) -> np.ndarray:
-    """Horizontal pelvis position: mean of the two hips, or either hip alone.
+def pelvis_x(kp: Keypoints, min_conf: float = 0.3, max_gap_s: float | None = None) -> np.ndarray:
+    """Horizontal pelvis position: the mean of the two hips.
 
     Parameters
     ----------
@@ -135,21 +140,44 @@ def pelvis_x(kp: Keypoints, min_conf: float = 0.3) -> np.ndarray:
         Keypoints of one clip.
     min_conf:
         Hip points below this confidence count as missing.
+    max_gap_s:
+        Each hip is interpolated across its own gaps up to this long before
+        the two are averaged; None means :data:`PELVIS_MAX_GAP_S`.
 
     Returns
     -------
     numpy.ndarray
-        ``(n_frames,)`` pixel x of the pelvis; NaN where neither hip is usable.
+        ``(n_frames,)`` pixel x of the pelvis; NaN where a hip is missing for
+        longer than ``max_gap_s``.
 
     Raises
     ------
     ValueError
         If the keypoints have neither ``LEFT_HIP`` nor ``RIGHT_HIP``.
+
+    Notes
+    -----
+    In a side view the two hips are not at the same image x: perspective
+    moves them apart by tens of pixels, by an amount that changes as the
+    walker crosses the image. Falling back to the one visible hip frame by
+    frame would add a step of half that offset to every foot signal, which
+    the peak picker sees (the same reason :func:`choose_foot_point` chooses
+    once per clip). So each hip is first interpolated across its own gaps,
+    and a frame where one hip is still missing is a missing pelvis. The
+    choice of hips is made once per clip: a file with one hip, or whose
+    other hip has fewer than half its confident frames, uses that hip alone
+    throughout.
     """
-    x = _mid_x(kp, "LEFT_HIP", "RIGHT_HIP", min_conf)
-    if x is None:
+    names = [n for n in ("LEFT_HIP", "RIGHT_HIP") if kp.has(n)]
+    if not names:
         raise ValueError(f"{kp.clip_id}: needs LEFT_HIP or RIGHT_HIP to locate the pelvis")
-    return x
+    counts = [int(np.sum(kp.confidence(n) >= min_conf)) for n in names]
+    names = [n for n, count in zip(names, counts) if count >= _POINT_USABLE_FRACTION * max(counts)]
+    max_gap_s = PELVIS_MAX_GAP_S if max_gap_s is None else max_gap_s
+    max_gap_frames = int(round(max_gap_s * kp.rate)) if kp.n_frames > 1 else 0
+    hips = [fill_gaps(kp.masked_point(n, min_conf)[:, 0], kp.time_s, max_gap_frames) for n in names]
+    # NaN in either hip makes the mean NaN, which is the point.
+    return np.mean(hips, axis=0)
 
 
 def choose_foot_point(kp: Keypoints, side: str, part: str, min_conf: float = 0.3) -> str | None:
@@ -265,11 +293,14 @@ def lowpass(values: np.ndarray, fps: float, cutoff_hz: float, order: int = FILTE
         Filtered samples, same length as ``values``.
     """
     values = np.asarray(values, dtype=float)
-    wn = effective_cutoff(cutoff_hz, fps) / (fps / 2.0)
-    sos = butter(order, wn, btype="low", output="sos")
-    # scipy's default padding needs more samples than a short segment may have.
-    padlen = min(3 * (2 * len(sos) + 1), len(values) - 1)
-    return sosfiltfilt(sos, values, padlen=padlen)
+    cutoff = effective_cutoff(cutoff_hz, fps)
+    sos = butter(order, cutoff / (fps / 2.0), btype="low", output="sos")
+    # Pad by a fixed time (FILTER_PAD_PERIODS cutoff periods) rather than
+    # scipy's fixed 15 samples, which is only 62 ms at 240 fps and lets the
+    # filter's start-up flatten the ends. Never pad less than scipy would,
+    # and never more than a short segment allows.
+    padlen = max(3 * (2 * len(sos) + 1), int(np.ceil(FILTER_PAD_PERIODS * fps / cutoff)))
+    return sosfiltfilt(sos, values, padlen=min(padlen, len(values) - 1))
 
 
 def foot_signals(
@@ -311,7 +342,7 @@ def foot_signals(
     """
     if direction not in (1, -1):
         raise ValueError(f"direction must be +1 or -1, got {direction!r}")
-    fps = sample_rate(kp)
+    fps = kp.rate
     pelvis = pelvis_x(kp, min_conf)
     max_gap_frames = int(round(max_gap_s * fps))
     # Below about 5 samples a 4th-order filter has nothing to work with.
@@ -374,17 +405,18 @@ def find_extrema(
     kind:
         ``"max"`` for heel strikes, ``"min"`` for toe offs.
     fps:
-        Sampling rate (:func:`sample_rate`) used to turn
-        ``min_event_interval_s`` into samples.
+        Sampling rate (:attr:`Keypoints.rate`) used to turn
+        ``min_event_interval_s`` and :data:`EDGE_RELAX_MAX_S` into samples.
     min_event_interval_s:
         Two peaks of the same kind closer than this are not both kept.
     prominence_frac:
         Minimum prominence as a fraction of the signal's robust range
         (:func:`robust_range`). The range is taken over all segments of the
         signal, so a short stretch of data cannot lower the bar for itself.
-        Next to a segment edge the edge side needs only
-        :data:`EDGE_PROMINENCE_FRACTION` of it (see :func:`_edge_aware_drop`),
-        so events in the first and last few frames are not lost.
+        For a peak within :data:`EDGE_RELAX_MAX_S` of a segment edge, the
+        edge side needs only :data:`EDGE_PROMINENCE_FRACTION` of it once the
+        fall is clearly larger than the jitter (:func:`noise_sd`, see
+        :func:`_edge_aware_drop`), so events in the last few frames are not lost.
     refine:
         Fit a parabola through each peak and its two neighbours to place it
         between frames.
@@ -403,12 +435,14 @@ def find_extrema(
         return []
     needed = prominence_frac * spread
     distance = max(1, int(round(min_event_interval_s * fps)))
+    max_edge_samples = int(np.floor(EDGE_RELAX_MAX_S * fps + 1e-9))
+    noise = noise_sd(signal)
     found: list[Extremum] = []
     for seg in signal.segments:
         y = sign * signal.smooth[seg]
         peaks, _ = find_peaks(y, distance=distance)
         for peak in peaks:
-            drop = _edge_aware_drop(y, peak)
+            drop = _edge_aware_drop(y, peak, max_edge_samples, noise)
             if drop < needed:
                 continue
             offset = parabolic_offset(y[peak - 1], y[peak], y[peak + 1]) if refine else 0.0
@@ -422,28 +456,56 @@ def find_extrema(
     return sorted(found, key=lambda e: e.position)
 
 
-def _edge_aware_drop(y: np.ndarray, peak: int) -> float:
+def noise_sd(signal: FootSignal) -> float:
+    """Robust estimate of the frame-to-frame jitter in ``signal.raw``, in pixels.
+
+    Taken from second differences within each segment. For white jitter of
+    standard deviation ``s`` their spread is ``sqrt(6) * s`` at any frame
+    rate, while the movement itself adds almost nothing: a planted foot
+    moves linearly relative to the pelvis, which has no second difference.
+    The median absolute deviation is used, so the large values at the sharp
+    turns of the signal (the kinks at HS and TO) do not count.
+    """
+    second = [np.diff(signal.raw[seg], 2) for seg in signal.segments if seg.stop - seg.start > 2]
+    if not second:
+        return 0.0
+    d2 = np.concatenate(second)
+    return float(1.4826 * np.median(np.abs(d2 - np.median(d2))) / np.sqrt(6.0))
+
+
+def _edge_aware_drop(y: np.ndarray, peak: int, max_edge_samples: int, noise: float = 0.0) -> float:
     """How far a peak stands out above its surroundings, allowing for segment edges.
 
     This is scipy's *prominence* with one change. On each side we look from
     the peak to the nearest higher sample (or the end of the data) and take
     the drop to the lowest point in between; the prominence is the smaller
     of the two drops. Next to the start or end of a segment that drop may be
-    cut short: if the lowest point is the very first or last sample, the
-    signal was still falling when the data ran out, so a real heel strike a
-    few frames before the end of a clip would fail the test. Such a
-    *censored* drop is divided by :data:`EDGE_PROMINENCE_FRACTION` before
-    the comparison; the other side must still pass on its own.
+    cut short: if the peak is at most ``max_edge_samples`` from the edge and
+    the lowest point is the very first or last sample, the signal was still
+    falling when the data ran out, so a real heel strike a few frames before
+    the end of a clip would fail the test. Such a *censored* drop is divided
+    by :data:`EDGE_PROMINENCE_FRACTION` before the comparison.
+
+    Two guards keep jitter from passing this way. A censored drop ends on
+    the outermost sample, which zero-phase filtering leaves almost
+    unsmoothed (it keeps nearly all of that frame's ``noise``), so the drop
+    is first shortened by :data:`EDGE_NOISE_MARGIN` times ``noise``: a fall
+    that one noisy sample could explain is not relaxed. And only one side
+    is relaxed; the other must pass in full, even in a segment so short that
+    both sides run into an edge.
     """
-    drops = []
+    sides = []
     for side in (y[peak::-1], y[peak:]):  # each side starts at the peak and moves outwards
         higher = np.flatnonzero(side[1:] > side[0])
         # find_peaks never returns a peak with a higher neighbour, so the window is never empty.
         window = side[1 : higher[0] + 1] if higher.size else side[1:]
         drop = side[0] - window.min()
-        reaches_edge = higher.size == 0 and np.argmin(window) == len(window) - 1
-        drops.append(drop / EDGE_PROMINENCE_FRACTION if reaches_edge else drop)
-    return float(min(drops))
+        censored = higher.size == 0 and len(window) <= max_edge_samples and np.argmin(window) == len(window) - 1
+        relaxed = max(drop, (drop - EDGE_NOISE_MARGIN * noise) / EDGE_PROMINENCE_FRACTION) if censored else drop
+        sides.append((drop, relaxed))
+    (drop0, relaxed0), (drop1, relaxed1) = sides
+    # Relax one side or the other, never both.
+    return float(max(min(relaxed0, drop1), min(drop0, relaxed1)))
 
 
 def parabolic_offset(left: float, centre: float, right: float) -> float:
@@ -639,10 +701,14 @@ def detect_relative_extrema(
     Notes
     -----
     Known limits: an event can only be found if the pelvis and the foot
-    point are both visible around it, and events in the first or last one
-    to two frames of a stretch of data may be missed. The walking direction
-    is estimated once per clip, so a there-and-back walk must be split into
-    single passes first.
+    point are both visible around it. Near either end of a stretch of data
+    only part of a peak is visible, so events within about 50 ms of an end
+    may be missed, and occasionally one up to about 0.12 s away (just past
+    :data:`EDGE_RELAX_MAX_S`). That limit is in time, not frames: 50 ms is
+    one frame at 25 fps, three at 60 fps and twelve at 240 fps. Noisy
+    keypoints widen it, since a fall at the very edge must be clearly larger
+    than the jitter to count. The walking direction is estimated once per
+    clip, so a there-and-back walk must be split into single passes first.
     """
     defaults = {
         "clip_id": kp.clip_id,
@@ -655,7 +721,7 @@ def detect_relative_extrema(
         return make_events([], defaults=defaults)
 
     walk_dir, _ = resolve_direction(kp, direction, min_conf)
-    fps = sample_rate(kp)
+    fps = kp.rate
     signal_kwargs = dict(
         direction=walk_dir,
         min_conf=min_conf,

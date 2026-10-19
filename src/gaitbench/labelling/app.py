@@ -43,16 +43,23 @@ An existing ``out_csv`` is otherwise loaded, so labelling can be resumed.
 Next to the labels a small JSON file (``<out_csv stem>.json``) records the
 video, the timestamp source and the frame count.
 
-Frame times come from, in order: a RealSense frames CSV next to the video
-(written by :func:`gaitbench.capture.realsense.bag_to_video`), then
+Frame times come from :func:`gaitbench.video.load_timestamps`, the same
+function the pose stage uses, so labels and keypoints share one timeline: a
+RealSense frames CSV next to the video (written by
+:func:`gaitbench.capture.realsense.bag_to_video`), then
 :func:`gaitbench.video.frame_timestamps` (real per-frame times, needed for
 variable-frame-rate iPhone clips), then ``frame / fps`` as a last resort,
 which is wrong for VFR video and says so on screen.
 
 macOS: OpenCV windows must be created on the main thread, so call
 :func:`run_labeller` from the main thread (a plain script or the CLI, not a
-worker thread). ``opencv-python-headless`` has no windows at all; install
-``opencv-python`` instead.
+worker thread). ``opencv-python-headless`` has no windows at all, and
+myogait installs it next to ``opencv-python``: the three OpenCV packages
+(also ``opencv-contrib-python``, from mediapipe) share one ``cv2``, and
+whichever was installed last wins. If the window cannot open, run
+``pip install --force-reinstall --no-deps opencv-python==<installed
+version>`` (``gaitbench env`` prints the exact command); do not uninstall
+one of them, which deletes files the others need.
 
 Frames are read by index. Seeking is slow for some codecs (HEVC from
 iPhones) and, for variable-frame-rate files, OpenCV's seek can land on the
@@ -76,8 +83,10 @@ from typing import Any, Protocol
 import numpy as np
 
 from .. import __version__
-from ..formats import SIDE_PREFIX, SIDES, Keypoints
-from .state import Edit, LabelSession
+from ..env import opencv_repair_command
+from ..formats import FormatError, SIDE_PREFIX, SIDES, Keypoints, sample_rate
+from ..video import load_timestamps  # noqa: F401  (lives in gaitbench.video, shared with the pose stage)
+from .state import Edit, LabelSession, frame_time_tolerance
 
 # Key name (as returned by decode_key) -> action.
 KEY_BINDINGS: dict[str, str] = {
@@ -374,7 +383,7 @@ class _VideoSource:
         self._times = None
         if container_times is not None and len(container_times) > 2:
             self._times = np.asarray(container_times, dtype=float)
-            self._tol_s = 0.5 * float(np.median(np.diff(self._times)))
+            self._tol_s = frame_time_tolerance(self._times)
         # Read frame 0 once to learn its time, which OpenCV may not report as 0.
         ok, img = self.cap.read()
         self._pending = img if ok else None
@@ -404,7 +413,7 @@ class _VideoSource:
             return
         actual = (float(self.cap.get(cv2.CAP_PROP_POS_MSEC)) - self._t0_ms) / 1000.0
         expected = float(self._times[index] - self._times[0])
-        if abs(actual - expected) <= self._tol_s:
+        if abs(actual - expected) <= self._tol_s[index]:
             self._pending = img
             return
         # Seek landed on another frame (typical of VFR files): decode from the
@@ -654,10 +663,11 @@ def render(
 
 def _local_halfwidth(session: LabelSession) -> int:
     """Half-width of the local timeline: about 0.75 s, at least 20 frames."""
-    if session.n_frames < 2:
+    try:
+        rate = sample_rate(session.timestamps)
+    except FormatError:  # one frame, or times that do not increase
         return 20
-    dt = float(np.median(np.diff(session.timestamps)))
-    return int(max(20, round(0.75 / dt))) if dt > 0 else 20
+    return int(max(20, round(0.75 * rate)))
 
 
 def _draw_timelines(cv2: Any, canvas: np.ndarray, session: LabelSession, lay: _Layout) -> None:
@@ -729,50 +739,8 @@ def _text(cv2: Any, img: np.ndarray, text: str, org: tuple[int, int], scale: flo
 
 
 # ---------------------------------------------------------------------------
-# Timestamps and files
+# Files
 # ---------------------------------------------------------------------------
-
-
-def load_timestamps(
-    video_path: str | Path,
-    timestamps_csv: str | Path | None = None,
-) -> tuple[np.ndarray | None, str, np.ndarray | None]:
-    """Find the best per-frame times for a video.
-
-    Parameters
-    ----------
-    video_path:
-        The video being labelled.
-    timestamps_csv:
-        A RealSense frames CSV to use (default: the one next to the video, if any).
-
-    Returns
-    -------
-    times:
-        ``(n_frames,)`` seconds from the first frame, or None if only the
-        nominal frame rate is available.
-    source:
-        ``"realsense:<file>"``, ``"video"`` or ``"nominal"``.
-    container_times:
-        The container's own frame times (for checking seeks), or None.
-    """
-    video_path = Path(video_path)
-    from ..capture.realsense import frame_times_path, read_frame_times
-
-    csv = Path(timestamps_csv) if timestamps_csv is not None else frame_times_path(video_path)
-    if timestamps_csv is not None or csv.is_file():
-        table = read_frame_times(csv)
-        return table["time_s"].to_numpy(dtype=float), f"realsense:{csv.name}", None
-    try:
-        from ..video import frame_timestamps
-    except ImportError:
-        return None, "nominal", None
-    try:
-        ts = frame_timestamps(video_path)
-    except (RuntimeError, OSError, ValueError) as exc:
-        warnings.warn(f"Could not read frame times of {video_path} ({exc}); using frame / fps", stacklevel=2)
-        return None, "nominal", None
-    return np.asarray(ts, dtype=float), "video", np.asarray(ts, dtype=float)
 
 
 def autosave_path(out_csv: str | Path) -> Path:
@@ -806,8 +774,8 @@ def _import_cv2() -> Any:
         import cv2
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise ImportError(
-            "The labeller needs OpenCV with GUI support: pip install opencv-python "
-            "(not opencv-python-headless)"
+            "The labeller needs OpenCV with GUI support: pip install 'gaitbench[video]'. If OpenCV is installed "
+            f"but broken, repair it (do not uninstall anything): {opencv_repair_command()}"
         ) from exc
     return cv2
 
@@ -931,8 +899,9 @@ def run_labeller(
     except cv2.error as exc:
         source.release()
         raise RuntimeError(
-            f"OpenCV cannot open a window ({exc}). Install opencv-python (with GUI) instead of "
-            "opencv-python-headless."
+            f"OpenCV cannot open a window ({exc}). This cv2 has no GUI: opencv-python-headless (which myogait "
+            "needs) was installed over opencv-python. Repair it, without uninstalling anything (the OpenCV "
+            f"packages share files, so uninstalling one breaks the others): {opencv_repair_command()}"
         ) from exc
 
     clicks: list[tuple[int, int]] = []

@@ -9,6 +9,16 @@ Apple Silicon note: an x86_64 Python running under Rosetta reports
 ``machine = "x86_64"`` on an arm64 Mac. It works but is several times slower
 and pulls different wheels (e.g. ``pyrealsense2-macosx`` exists only for
 arm64), so ``rosetta`` is reported separately.
+
+OpenCV note: ``opencv-python`` (the ``video`` extra, with windows),
+``opencv-python-headless`` (required by myogait) and
+``opencv-contrib-python`` (required by mediapipe) all install the same
+``cv2`` package, and whichever was installed last wins. If that is the
+headless one, the labeller cannot open a window. :func:`opencv_gui` checks
+the ``GUI`` line of ``cv2.getBuildInformation()``, and ``gaitbench env``
+prints the repair, ``pip install --force-reinstall --no-deps
+opencv-python==<installed version>``. Uninstalling one of the three is not
+a fix: it deletes files the others share and leaves a broken ``cv2``.
 """
 
 from __future__ import annotations
@@ -42,6 +52,8 @@ PACKAGES: tuple[str, ...] = (
     "pyrealsense2",
     "pyrealsense2-macosx",
 )
+# The distributions that install ``cv2``; see the module docstring.
+OPENCV_DISTRIBUTIONS: tuple[str, ...] = ("opencv-python", "opencv-python-headless", "opencv-contrib-python")
 
 
 def package_version(name: str) -> str | None:
@@ -92,6 +104,46 @@ def git_info(path: str | Path | None = None) -> dict[str, Any] | None:
         "branch": run("rev-parse", "--abbrev-ref", "HEAD"),
         "dirty": bool(status) if status is not None else None,
         "root": root,
+    }
+
+
+def opencv_repair_command() -> str:
+    """pip command that puts OpenCV's GUI build back over the headless one, uninstalling nothing.
+
+    Pinned to the installed OpenCV version (``opencv-python``'s, else the
+    headless or contrib package's), so no other package's requirement moves.
+    """
+    version = next((v for v in map(package_version, OPENCV_DISTRIBUTIONS) if v), None)
+    return "pip install --force-reinstall --no-deps opencv-python" + (f"=={version}" if version else "")
+
+
+def opencv_gui() -> dict[str, Any] | None:
+    """Whether the installed ``cv2`` can open windows, as the labeller needs.
+
+    Returns
+    -------
+    dict or None
+        ``version`` (``cv2.__version__``), ``gui`` (the ``GUI`` line of
+        ``cv2.getBuildInformation()``: e.g. ``QT5``, ``COCOA``, or ``NONE``
+        for a headless build), ``has_gui`` and ``fix`` (the command from
+        :func:`opencv_repair_command` when there is no GUI, else None).
+        None if ``cv2`` cannot be imported.
+    """
+    try:
+        import cv2
+    except Exception:  # noqa: BLE001 - a half-uninstalled cv2 can fail in many ways
+        return None
+    try:
+        build = str(cv2.getBuildInformation())
+    except Exception:  # noqa: BLE001 - broken installs lack the function
+        build = ""
+    gui = next((line.split(":", 1)[1].strip() for line in build.splitlines() if line.strip().startswith("GUI:")), None)
+    has_gui = bool(gui) and gui.upper() != "NONE"
+    return {
+        "version": getattr(cv2, "__version__", None),
+        "gui": gui,
+        "has_gui": has_gui,
+        "fix": None if has_gui else opencv_repair_command(),
     }
 
 

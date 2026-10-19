@@ -27,6 +27,15 @@ import_openpose:
     width: 960
     height: 540
 
+# OpenPose swaps the leg labels for a frame or a few as the legs cross (near t = 1.4, 2.5, 2.7 and 3.1 s
+# in the left-camera clip), which coordinate-based detectors read as extra events. Cleaning writes an
+# `openpose-clean` copy (gaitbench/clean.py) before detection; because `backends` is a list, the copy is
+# added to it, so raw and cleaned keypoints are compared side by side. Per-frame reports go to clean/.
+clean:
+  steps: [leg_swaps]
+  params:
+    leg_swaps: {}   # defaults; see gaitbench.clean.fix_leg_swaps for min_conf, switch_penalty, ...
+
 clips: all
 backends: [openpose]
 detectors:

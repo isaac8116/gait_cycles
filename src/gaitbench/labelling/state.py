@@ -40,6 +40,37 @@ from ..formats import EVENT_TYPES, SIDES, FormatError, make_events, read_labels,
 REPLACE_WINDOW_FRAMES = 2
 
 
+def frame_time_tolerance(
+    timestamps: Sequence[float] | np.ndarray, frames: Sequence[int] | np.ndarray | None = None
+) -> np.ndarray:
+    """Half the gap from each frame's time to its nearer neighbour's, in seconds.
+
+    A time within this of a frame's time cannot be an adjacent frame's,
+    however irregular the intervals. Half the *median* interval is not safe:
+    on a variable-frame-rate clip one interval can be much shorter than the
+    median, and a 240 fps clip in a 1/600 s time base alternates 3.33 and
+    5 ms intervals, so its median depends on the frame count.
+
+    Parameters
+    ----------
+    timestamps:
+        ``(n_frames,)`` frame times.
+    frames:
+        Frame indices to return the tolerance for (default: every frame).
+
+    Returns
+    -------
+    numpy.ndarray
+        One tolerance per frame; infinite where a frame has no neighbour at
+        a later or earlier time (a single-frame clip).
+    """
+    ts = np.asarray(timestamps, dtype=float).reshape(-1)
+    gaps = np.diff(ts)
+    gaps = np.where(gaps > 0, gaps, np.inf)
+    half = 0.5 * np.minimum(np.r_[np.inf, gaps], np.r_[gaps, np.inf])
+    return half if frames is None else half[np.asarray(frames, dtype=np.int64)]
+
+
 @dataclass(frozen=True, order=True)
 class LabelledEvent:
     """One labelled event. Ordered by frame, then side, then event."""
@@ -497,7 +528,7 @@ class LabelSession:
             return
         frames = df["frame"].to_numpy()
         expected = self._timestamps[frames]
-        tol = 0.5 * float(np.median(np.diff(self._timestamps)))
+        tol = frame_time_tolerance(self._timestamps, frames)
         diff = np.abs(df["time_s"].to_numpy(dtype=float) - expected)
         n_off = int(np.sum(diff > tol))
         if n_off:

@@ -877,3 +877,111 @@ def test_run_labeller_zoom_uses_keypoints(tmp_path, monkeypatch):
     out = run_labeller(video, tmp_path / "walk__carol.csv", "carol", keypoints_path=kp_path)
     assert read_labels(out)["frame"].tolist() == [1]
     assert len({shape for shape in gui.shown}) == 1  # zoom keeps the canvas size
+
+
+# ---------------------------------------------------------------------------
+# Frame-time tolerances and the OpenCV repair hint (review findings)
+# ---------------------------------------------------------------------------
+
+
+def tick600(n: int = 480) -> np.ndarray:
+    """240 fps in a 1/600 s time base: 2- and 3-tick intervals (3.33 and 5 ms)."""
+    return np.floor(np.arange(n) * 2.5) / 600
+
+
+@pytest.mark.parametrize(
+    "ts",
+    [tick600(480), tick600(479), np.r_[0.0, 1 / 30, 1 / 30 + 0.01, 2 / 30 + 0.01, 3 / 30 + 0.01]],
+    ids=["tick600-even", "tick600-odd", "vfr-short-interval"],
+)
+def test_frame_time_tolerance_never_reaches_a_neighbour(ts):
+    from gaitbench.labelling.state import frame_time_tolerance
+
+    tol = frame_time_tolerance(ts)
+    gaps = np.diff(ts)
+    assert np.all(tol[1:] < gaps) and np.all(tol[:-1] < gaps)
+    np.testing.assert_allclose(frame_time_tolerance(ts, [0, 2]), tol[[0, 2]])
+    assert np.isinf(frame_time_tolerance([0.5])).all()
+
+
+def test_load_warns_when_label_times_are_an_adjacent_frames(tmp_path):
+    """Half the median interval (16.7 ms here) would accept the next frame's time, 10 ms away."""
+    ts = np.r_[0.0, 1 / 30, 1 / 30 + 0.01, np.arange(3, 30) / 30 + 0.01]
+    s = LabelSession("c", "bob", timestamps=ts)
+    s.goto(1)
+    s.add("L", "HS")
+    df = s.to_events_df()
+    df["time_s"] = ts[2]  # the times of a timeline one frame off
+    path = write_labels(df, tmp_path / "off.csv")
+    with pytest.warns(UserWarning, match="differ from this video's frame times"):
+        LabelSession("c", "bob", timestamps=ts).load(path)
+
+
+def test_local_timeline_width_uses_the_mean_rate():
+    from gaitbench.labelling.app import _local_halfwidth
+
+    for n in (480, 479):
+        assert _local_halfwidth(LabelSession("c", "r", timestamps=tick600(n))) == 180  # 0.75 s at 240 fps
+    assert _local_halfwidth(LabelSession("c", "r", timestamps=[0.0])) == 20
+
+
+class FakeCapture:
+    """cv2.VideoCapture over known frame times; a seek to frame i lands on frame i + ``seek_error``."""
+
+    def __init__(self, times, seek_error=0):
+        self.times, self.seek_error, self.pos = np.asarray(times), seek_error, 0
+
+    def isOpened(self):
+        return True
+
+    def get(self, prop):
+        if prop == "POS_MSEC":
+            return 1000.0 * self.times[max(self.pos - 1, 0)]
+        return {"FPS": 30.0, "COUNT": len(self.times)}.get(prop, 0.0)
+
+    def set(self, prop, value):
+        self.pos = int(value) + (self.seek_error if value else 0)
+
+    def read(self):
+        self.pos += 1
+        return self.pos <= len(self.times), np.full((4, 4, 3), self.pos - 1, np.uint8)
+
+    def grab(self):
+        return self.read()[0]
+
+    def release(self):
+        pass
+
+
+def test_video_source_rejects_a_seek_to_an_adjacent_frame():
+    from types import SimpleNamespace
+
+    from gaitbench.labelling.app import _VideoSource
+
+    ts = np.r_[np.arange(0, 20) / 30, 19 / 30 + 0.01, np.arange(20, 40) / 30 + 0.01]
+    for error, exact in ((0, True), (1, False)):
+        cv2 = SimpleNamespace(CAP_PROP_FPS="FPS", CAP_PROP_FRAME_COUNT="COUNT", CAP_PROP_POS_MSEC="POS_MSEC",
+                              CAP_PROP_POS_FRAMES="POS_FRAMES", VideoCapture=lambda path: FakeCapture(ts, error))
+        src = _VideoSource(cv2, "fake.mp4", container_times=ts)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            src.seek(19)  # landing on frame 20 is only 10 ms off, under half the median interval
+        assert src.exact_seek is exact
+        assert any("Seeking is inexact" in str(w.message) for w in caught) is not exact
+        assert int(src.read()[0, 0, 0]) == 19
+
+
+def test_run_labeller_window_error_gives_the_opencv_repair(tmp_path, monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    from gaitbench import env
+    from gaitbench.labelling import run_labeller
+
+    video = write_test_video(tmp_path / "walk.mp4", n=10)
+
+    def no_window(*args, **kwargs):
+        raise cv2.error("The function is not implemented. Rebuild the library with GTK+ 2.x or Cocoa support")
+
+    monkeypatch.setattr(cv2, "namedWindow", no_window)
+    monkeypatch.setattr(env, "package_version", lambda name: "5.0.0.93" if name.startswith("opencv") else None)
+    with pytest.raises(RuntimeError, match=r"pip install --force-reinstall --no-deps opencv-python==5\.0\.0\.93"):
+        run_labeller(video, tmp_path / "walk__a.csv", "a")

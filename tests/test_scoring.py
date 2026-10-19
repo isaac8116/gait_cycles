@@ -23,6 +23,7 @@ from gaitbench.scoring import (
     match_events,
     pair_cycles,
     temporal_parameters,
+    timestamp_slack,
 )
 from gaitbench.synthetic import WalkerParams, simulate_walk
 
@@ -133,7 +134,7 @@ def test_events_outside_truth_span_are_ignored():
     m = match_events(pred, truth, tolerance_s=0.1, restrict_to_truth_span=True)
     assert statuses(m) == ["TP", "TP", "TP"]
     assert m["error_s"].tolist() == pytest.approx([-0.08, 0.08, 0.0])
-    # Inside the span (any side/event sets it), an unmatched prediction still counts.
+    # Inside the span (either side's heel strikes set it), an unmatched prediction still counts.
     pred_in = pd.concat([pred, events([("R", "HS", 1.2)])])
     m_in = match_events(pred_in, truth)
     assert (m_in.status == "FP").sum() == 1
@@ -150,6 +151,28 @@ def test_clip_without_truth_is_skipped_only_when_restricted():
     assert m["clip_id"].tolist() == ["c1"] and statuses(m) == ["TP"]
     m_all = match_events(pred, truth, restrict_to_truth_span=False)
     assert m_all.loc[m_all.clip_id == "c2", "status"].tolist() == ["FP"]
+
+
+def test_truth_span_is_per_event_type():
+    # A perfect detector on a 10 s walk. Labels may cover heel strikes
+    # throughout and toe offs only partly (the plan's "heel strikes first"
+    # fallback); unlabelled toe offs must not become false positives.
+    truth = simulate_walk(fps=240.0, duration_s=10.0, seed=0).truth
+    pred = truth.assign(tool="perfect", detector="perfect", backend="b")
+    hs_only = truth[truth.event == "HS"]
+    m = match_events(pred, hs_only)
+    assert set(m["event"]) == {"HS"} and statuses(m) == ["TP"] * len(hs_only)
+    to_window = truth[(truth.event == "HS") | truth.time_s.between(3.0, 6.0)]
+    out = event_metrics(match_events(pred, to_window)).set_index("event")
+    assert out.loc["TO", "n_truth"] == (to_window.event == "TO").sum()
+    assert out.loc["TO", "precision"] == 1.0 and out.loc["HS", "precision"] == 1.0
+    # The span is per event type, not per side: a spurious left heel strike
+    # before the first left label, but after the first right one, counts.
+    first = truth[truth.event == "HS"].groupby("side")["time_s"].min()
+    assert first["L"] - first["R"] > 0.2
+    extra = events([("L", "HS", first["R"])], clip=truth.clip_id.iloc[0], detector="perfect", backend="b")
+    m2 = match_events(pd.concat([pred, extra]), truth)
+    assert m2.loc[m2.status == "FP", "pred_time_s"].tolist() == [first["R"]]
 
 
 def test_empty_pred_gives_all_fn():
@@ -286,6 +309,77 @@ def test_metrics_fps_per_clip():
     assert out.set_index("clip_id")["p_within_1_frame"].to_dict() == {"a": 1.0, "b": 0.0}
     with pytest.raises(ValueError, match="No fps"):
         event_metrics(m, fps={"a": 60.0})
+
+
+def ticked_240fps_raters(offset_frames):
+    """Rater B ``offset_frames`` after rater A on 18 heel strikes of a 240 fps
+    clip whose times are in a 1/600 s time base (2- and 3-tick intervals)."""
+    t = np.floor(2.5 * np.arange(2400)) / 600
+    fa = np.arange(100, 2300, 125)
+    a = truth_events([("L", "HS", t[f], f) for f in fa])
+    b = events([("L", "HS", t[f + offset_frames], f + offset_frames) for f in fa], detector="raterB", tool="human")
+    return t, agreement(b, a)
+
+
+def test_within_frames_tolerates_timestamp_quantisation():
+    t, m = ticked_240fps_raters(1)
+    assert sorted(set(np.round(1000 * m["error_s"], 3))) == [3.333, 5.0]
+    slack = timestamp_slack(t, 240.0)
+    assert slack == pytest.approx(1 / 1200)
+    # Exactly one frame late on every heel strike: all within one frame.
+    out = event_metrics(m, fps=240.0, slack_s=slack).iloc[0]
+    assert out.p_within_1_frame == 1.0 and out.mae_frames == pytest.approx(1.0)
+    grid = event_metrics(m, fps=240.0, same_frame_grid=True).iloc[0]
+    assert grid.p_within_1_frame == 1.0 and grid.mae_frames == 1.0
+    assert event_metrics(m, fps=240.0, slack_s={"c1": slack}, group_by=None).iloc[0].p_within_1_frame == 1.0
+    # The slack does not let a two-frame offset pass as one.
+    _, m2 = ticked_240fps_raters(2)
+    for kw in ({"slack_s": slack}, {"same_frame_grid": True}):
+        two = event_metrics(m2, fps=240.0, **kw).iloc[0]
+        assert two.p_within_1_frame == 0.0 and two.p_within_2_frames == 1.0
+    with pytest.raises(ValueError, match="No slack_s"):
+        event_metrics(m, fps=240.0, slack_s={"other": slack})
+    with pytest.raises(ValueError, match="slack_s"):
+        event_metrics(m, fps=240.0, slack_s=-1.0)
+
+
+def test_timestamp_slack_and_decimated_copy_in_its_own_frames():
+    t = np.floor(2.5 * np.arange(2400)) / 600
+    # A 60 fps copy (every 4th frame, 10-tick intervals) has exact times.
+    assert timestamp_slack(t[::4], 60.0) == pytest.approx(0.0, abs=1e-12)
+    # A dropped frame is not rounding and does not widen the slack.
+    assert timestamp_slack(np.delete(t[::4], 50), 60.0) == pytest.approx(0.0, abs=1e-12)
+    assert timestamp_slack(t) == pytest.approx(1 / 1200, rel=1e-3)
+    assert timestamp_slack(t[:1]) == 0.0
+    # One copy frame late is 4 source frames: judged in the copy's 60 fps frames.
+    fa = np.arange(100, 2300, 124)
+    truth = truth_events([("L", "HS", t[f], f) for f in fa])
+    pred = events([("L", "HS", t[f + 4], f + 4) for f in fa])
+    out = event_metrics(match_events(pred, truth), fps=60.0, slack_s=timestamp_slack(t[::4], 60.0)).iloc[0]
+    assert out.p_within_1_frame == 1.0 and out.mae_frames == pytest.approx(1.0)
+
+
+def test_default_grouping_keeps_sources_apart():
+    # Two versions of one detector: 0.8.9 exact, 0.9.1 50 ms late.
+    truth = simulate_walk(fps=60.0, duration_s=6.0, seed=0).truth
+    a = truth.assign(tool="myogait", tool_version="0.8.9", detector="zeni", backend="mp")
+    b = a.assign(tool_version="0.9.1", time_s=truth.time_s + 0.05)
+    m = match_events(pd.concat([a, b], ignore_index=True), truth)
+    out = event_metrics(m, fps=60)
+    assert list(out.columns[:5]) == ["tool", "tool_version", "backend", "detector", "event"]
+    hs = out[out.event == "HS"].set_index("tool_version")
+    assert hs["n_truth"].tolist() == [(truth.event == "HS").sum()] * 2
+    assert hs["bias_ms"].to_dict() == pytest.approx({"0.8.9": 0.0, "0.9.1": 50.0})
+    # A table without some source columns is grouped by those it has.
+    assert len(event_metrics(m.drop(columns=["tool", "tool_version"]))) == 2
+    # Pooling stays possible, but only when asked for.
+    assert len(event_metrics(m, group_by=("detector", "event"))) == 2
+
+    truth_p = temporal_parameters(truth)
+    params = compare_parameters(temporal_parameters(pd.concat([a, b], ignore_index=True)), truth_p)
+    stride = params[params.parameter == "stride_time_s"].set_index("tool_version")
+    assert stride["n_truth_cycles"].tolist() == [len(truth_p)] * 2
+    assert {"tool", "backend", "detector"} <= set(params.columns)
 
 
 @pytest.mark.filterwarnings("error")

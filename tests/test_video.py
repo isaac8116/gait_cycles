@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gaitbench.video import cfr_command, frame_timestamps, is_variable_frame_rate, probe_video
+from gaitbench.video import cfr_command, frame_timestamps, is_variable_frame_rate, load_timestamps, probe_video
 
 FFMPEG = shutil.which("ffmpeg")
 needs_ffmpeg = pytest.mark.skipif(
@@ -124,14 +125,113 @@ def test_cfr_command_makes_constant_rate_copy(videos: dict[str, Path], tmp_path:
 def test_cfr_command_arguments() -> None:
     cmd = cfr_command("in.mov", "out.mp4", 60)
     assert cmd[0] == "ffmpeg" and cmd[-1] == "out.mp4"
-    assert cmd[cmd.index("-vf") + 1] == "fps=60"
-    assert "-c:a" in cmd and "0:a:0?" in cmd
+    assert cmd[cmd.index("-vf") + 1] == "setpts=PTS-STARTPTS,fps=60:round=up"
+    assert "-c:a" in cmd and "0:a:0?" in cmd and "-af" not in cmd
     quiet = cfr_command("in.mov", "out.mp4", 29.97, audio=False)
-    assert quiet[quiet.index("-vf") + 1] == "fps=29.97" and "-an" in quiet
-    assert cfr_command("a", "b", "30000/1001")[cfr_command("a", "b", "30000/1001").index("-vf") + 1] == "fps=30000/1001"
+    assert quiet[quiet.index("-vf") + 1] == "setpts=PTS-STARTPTS,fps=29.97:round=up" and "-an" in quiet
+    ntsc = cfr_command("a", "b", "30000/1001")
+    assert ntsc[ntsc.index("-vf") + 1] == "setpts=PTS-STARTPTS,fps=30000/1001:round=up"
+    late = cfr_command("a", "b", 60, video_start_s=0.1)
+    assert late[late.index("-af") + 1] == "atrim=start=0.1,asetpts=PTS-0.1/TB"
+    assert "-af" not in cfr_command("a", "b", 60, audio=False, video_start_s=0.1)
     for bad in (0, -1, "x", float("nan")):
         with pytest.raises(ValueError):
             cfr_command("a", "b", bad)
+    with pytest.raises(ValueError):
+        cfr_command("a", "b", 60, video_start_s=-0.1)
+
+
+# Frame index written into the pixels as 10 black/white blocks, so a copy's
+# frames can be traced back to the source frame they show.
+_W, _H, _BITS, _BLOCK = 320, 64, 10, 32
+
+
+def _index_frame(i: int) -> np.ndarray:
+    img = np.zeros((_H, _W), np.uint8)
+    for b in range(_BITS):
+        if (i >> b) & 1:
+            img[:, b * _BLOCK:(b + 1) * _BLOCK] = 255
+    return img
+
+
+def _shown_indices(path: Path) -> np.ndarray:
+    raw = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                         check=True, capture_output=True).stdout
+    imgs = np.frombuffer(raw, np.uint8).reshape(-1, _H, _W)
+    inner = imgs[:, 8:-8, :].reshape(len(imgs), _H - 16, _BITS, _BLOCK)[:, :, :, 8:-8].mean(axis=(1, 3))
+    return (inner > 127).astype(int) @ (1 << np.arange(_BITS))
+
+
+@pytest.fixture(scope="module")
+def slowmo(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    """240 fps sources in a 1/600 s time base (as iPhone slow motion stores them), frame index in the pixels.
+
+    ``plain`` starts with its first frame; in ``late`` the video starts 0.1 s
+    after the audio, with a beep in the audio when source frame 120 is shown.
+    """
+    if FFMPEG is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe not on PATH")
+    d = tmp_path_factory.mktemp("slowmo")
+    raw = d / "raw.mp4"
+    proc = subprocess.Popen([FFMPEG, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{_W}x{_H}",
+                             "-r", "240", "-i", "-", "-c:v", "libx264", "-qp", "0", "-video_track_timescale", "600",
+                             str(raw)], stdin=subprocess.PIPE)
+    for i in range(480):
+        proc.stdin.write(_index_frame(i).tobytes())
+    proc.stdin.close()
+    assert proc.wait() == 0
+    plain = d / "plain.mov"
+    _ffmpeg("-i", str(raw), "-c", "copy", "-video_track_timescale", "600", str(plain))
+    late = d / "late.mov"
+    beep = "aevalsrc=exprs='if(between(t\\,0.6\\,0.61)\\,sin(2*PI*1000*t)\\,0)':s=48000:d=2.1"
+    _ffmpeg("-itsoffset", "0.1", "-i", str(raw), "-f", "lavfi", "-i", beep, "-map", "0:v", "-map", "1:a",
+            "-c:v", "copy", "-c:a", "pcm_s16le", "-video_track_timescale", "600", str(late))
+    return {"plain": plain, "late": late}
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("source", ["plain", "late"])
+@pytest.mark.parametrize("fps, step", [(60, 4), (30, 8)])
+def test_cfr_copy_frames_carry_their_source_times(slowmo: dict[str, Path], tmp_path: Path, source: str,
+                                                  fps: int, step: int) -> None:
+    """Copy frame k shows source frame k * step, at that frame's own time (CFR-1)."""
+    src = slowmo[source]
+    info = probe_video(src, timestamps=False)
+    video_start = info["start_time_s"] - info["file_start_s"]
+    assert video_start == pytest.approx(0.1 if source == "late" else 0.0, abs=1e-3)
+    dst = tmp_path / "copy.mp4"
+    subprocess.run(cfr_command(src, dst, fps, preset="ultrafast", video_start_s=video_start, ffmpeg=FFMPEG),
+                   check=True, capture_output=True)
+    shown = _shown_indices(dst)
+    n = 480 // step
+    np.testing.assert_array_equal(shown[:n], np.arange(n) * step)
+    copy_t, src_t = frame_timestamps(dst), frame_timestamps(src)
+    np.testing.assert_allclose(copy_t[:n], src_t[shown[:n]], atol=1e-4)
+    if source == "late":
+        # The audio moved with the video: the beep is heard when frame 120 is shown (0.5 s).
+        streams = json.loads(subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", str(dst)],
+            check=True, capture_output=True, text=True).stdout)["streams"]
+        start = {s["codec_type"]: float(s["start_time"]) for s in streams}
+        pcm = subprocess.run([FFMPEG, "-v", "error", "-i", str(dst), "-map", "0:a", "-f", "f32le", "-ac", "1",
+                              "-ar", "48000", "-"], check=True, capture_output=True).stdout
+        heard = int(np.argmax(np.abs(np.frombuffer(pcm, np.float32)) > 0.3)) / 48000 + start["audio"] - start["video"]
+        assert heard == pytest.approx(src_t[120], abs=2e-3)
+
+
+def test_load_timestamps_prefers_a_realsense_csv(tmp_path: Path) -> None:
+    from gaitbench.capture.realsense import frame_times_path, frame_times_table, write_frame_times
+
+    video = tmp_path / "rs.mp4"
+    video.write_bytes(b"not a video")
+    rows = [{"frame": i, "rs_frame_number": i, "timestamp_ms": 1000.0 + 40.0 * i} for i in range(3)]
+    write_frame_times(frame_times_table(rows), frame_times_path(video))
+    times, source, container = load_timestamps(video)
+    assert source == "realsense:rs.frames.csv" and container is None
+    np.testing.assert_allclose(times, [0.0, 0.04, 0.08])
+    frame_times_path(video).unlink()
+    with pytest.warns(UserWarning, match="Could not read frame times"):
+        assert load_timestamps(video) == (None, "nominal", None)
 
 
 def test_is_variable_frame_rate() -> None:

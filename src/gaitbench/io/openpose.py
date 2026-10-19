@@ -194,7 +194,8 @@ def load_openpose_dir(
         If ``fps``/``width``/``height`` are missing and no video is given.
     """
     json_dir = Path(json_dir)
-    files = sorted(json_dir.glob("*_keypoints.json"))
+    # Skip hidden files, including the '._*' AppleDouble copies macOS writes on exFAT/FAT/SMB drives.
+    files = sorted(f for f in json_dir.glob("*_keypoints.json") if not f.name.startswith("."))
     if not files:
         raise FileNotFoundError(f"No *_keypoints.json files in {json_dir}")
     if foot_index is not None and foot_index not in FOOT_INDEX_CHOICES:

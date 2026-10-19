@@ -8,10 +8,15 @@ numbers measured on it say nothing about accuracy on real people**.
 
 Model, in world coordinates (metres, X along the walkway, Y up, ground at 0):
 
-* The pelvis moves forward at constant speed with a small vertical bob.
+* The pelvis moves forward at constant speed with a small vertical bob. By
+  default both hips sit on the pelvis point; ``hip_offset_m`` moves them
+  apart the way perspective does in a real side view.
 * Each foot is rigid. In stance it stays where it landed. In swing it moves
   one stride forward along a smooth profile whose speed rises and falls
-  steeply at the ends, and lifts off the ground by a few centimetres.
+  steeply at the ends, and lifts off the ground by a few centimetres. By
+  default it stays flat through stance, so heel, ankle and toe signals have
+  the same shape; ``heel_off_frac`` adds a heel rise (the foot rolls about
+  the toe) before toe off, so they differ as on real feet.
 * Heel strike is the instant a foot lands, toe off the instant it lifts.
   Left and right are half a cycle apart.
 * Knees come from two-link inverse kinematics; trunk, head and arms are
@@ -47,6 +52,10 @@ _SHOULDER_ABOVE_HIP = 0.30
 _NOSE_ABOVE_HIP = 0.40
 _UPPER_ARM = 0.186
 _FOREARM = 0.146
+# Heel rise (WalkerParams.heel_off_frac): foot angle at toe off, and how the
+# angle grows from heel off (angle ~ progress ** power, fastest at push-off).
+_HEEL_RISE_DEG = 35.0
+_HEEL_RISE_POWER = 2.0
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,16 @@ class WalkerParams:
     noise_px: float = 0.0
     dropout_prob: float = 0.0
     seed: int = 0
+    # How far apart the two hips appear along the walkway, in metres, when the
+    # walker is at the edge of the image. Perspective puts the near hip further
+    # from the image centre than the far one, so the gap grows with distance
+    # from the centre and changes sign as the walker crosses it. 0 puts both
+    # hips on the pelvis point.
+    hip_offset_m: float = 0.0
+    # Heel off as a fraction of stance. From then until toe off the foot rolls
+    # about the toe, raising the heel, and it flattens again in early swing.
+    # None keeps the foot flat through stance (a rigid foot).
+    heel_off_frac: float | None = None
 
     def __post_init__(self) -> None:
         if self.direction not in (1, -1):
@@ -87,6 +106,8 @@ class WalkerParams:
             raise ValueError("near_side must be 'L' or 'R'")
         if not 0.0 < self.stance_frac < 1.0:
             raise ValueError("stance_frac must be between 0 and 1")
+        if self.heel_off_frac is not None and not 0.0 <= self.heel_off_frac < 1.0:
+            raise ValueError("heel_off_frac must be None or in [0, 1)")
         if self.fps <= 0 or self.duration_s <= 0 or self.stride_time_s <= 0:
             raise ValueError("fps, duration_s and stride_time_s must be positive")
 
@@ -123,19 +144,28 @@ def simulate_walk(params: WalkerParams | None = None, **overrides: Any) -> Synth
     pelvis_y = _HIP_HEIGHT * h + 0.015 * np.cos(4.0 * np.pi * t / T)
     camera_x = p.pan_speed_mps * t
 
+    # Left minus right hip position along the walkway (see WalkerParams.hip_offset_m).
+    half_view_m = p.width / 2.0 / p.px_per_m
+    near_sign = 1.0 if p.near_side == "L" else -1.0
+    hip_gap = near_sign * p.hip_offset_m * np.clip((pelvis_x - camera_x) / half_view_m, -1.0, 1.0)
+
     world: dict[str, np.ndarray] = {}
     for side, phase0 in (("R", p.right_phase0), ("L", p.right_phase0 + 0.5)):
         heel = _foot_heel(t, phase0, p, start)
         prefix = "RIGHT_" if side == "R" else "LEFT_"
         foot = _FOOT * h
         lift = heel[:, 1]
-        world[prefix + "HEEL"] = heel
-        world[prefix + "ANKLE"] = np.column_stack([heel[:, 0] + 0.25 * foot, lift + _ANKLE_HEIGHT * h])
+        ankle = np.column_stack([heel[:, 0] + 0.25 * foot, lift + _ANKLE_HEIGHT * h])
         toe = np.column_stack([heel[:, 0] + foot, 0.6 * lift])
+        if p.heel_off_frac is not None:
+            heel, ankle = _roll_about_toe(toe[:, 0], lift, _heel_roll(t, phase0, p), foot, _ANKLE_HEIGHT * h)
+        world[prefix + "HEEL"] = heel
+        world[prefix + "ANKLE"] = ankle
         world[prefix + "FOOT_INDEX"] = toe
         world[prefix + "BIG_TOE"] = toe.copy()
         world[prefix + "SMALL_TOE"] = toe - np.array([0.02, 0.0])
-        hip = np.column_stack([pelvis_x, pelvis_y])
+        hip_x = pelvis_x + (0.5 if side == "L" else -0.5) * hip_gap if p.hip_offset_m else pelvis_x
+        hip = np.column_stack([hip_x, pelvis_y])
         world[prefix + "HIP"] = hip
         world[prefix + "KNEE"] = _knee(hip, world[prefix + "ANKLE"], _THIGH * h, _SHANK * h)
 
@@ -223,6 +253,39 @@ def _foot_heel(t: np.ndarray, phase0: float, p: WalkerParams, start: float) -> n
     x[swing] += p.stride_length_m * betainc(_SWING_SHAPE, _SWING_SHAPE, tau)
     y[swing] = p.swing_clearance_m * np.sin(np.pi * tau)
     return np.column_stack([x, y])
+
+
+def _heel_roll(t: np.ndarray, phase0: float, p: WalkerParams) -> np.ndarray:
+    """Foot angle in radians (0 = flat, positive = heel up) for a heel rise before toe off.
+
+    The angle grows from heel off to :data:`_HEEL_RISE_DEG` at toe off,
+    fastest at the end as in push-off. It leaves toe off at that same
+    angular speed (so the heel and ankle do not change speed abruptly) and
+    is back to 0 by mid-swing, long before the next heel strike.
+    """
+    _, phi = _cycle(t, phase0, p.stride_time_s)
+    s = p.stance_frac
+    heel_off = p.heel_off_frac * s
+    top = np.deg2rad(_HEEL_RISE_DEG)
+    roll = np.zeros_like(phi)
+    rising = (phi >= heel_off) & (phi < s)
+    roll[rising] = top * ((phi[rising] - heel_off) / (s - heel_off)) ** _HEEL_RISE_POWER
+    # Cubic Hermite curve from (top, push-off speed) at toe off to (0, 0) at mid-swing.
+    swing = phi >= s
+    x = np.minimum((phi[swing] - s) / (0.5 * (1.0 - s)), 1.0)
+    speed = top * _HEEL_RISE_POWER / (s - heel_off) * 0.5 * (1.0 - s)
+    roll[swing] = top * (2 * x**3 - 3 * x**2 + 1) + speed * (x**3 - 2 * x**2 + x)
+    return roll
+
+
+def _roll_about_toe(
+    toe_x: np.ndarray, lift: np.ndarray, roll: np.ndarray, foot: float, ankle_height: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Heel and ankle of a foot turned by ``roll`` about its toe (same as the rigid foot at 0)."""
+    cos, sin = np.cos(roll), np.sin(roll)
+    heel = np.column_stack([toe_x - foot * cos, lift + foot * sin])
+    ankle = np.column_stack([toe_x - 0.75 * foot * cos + ankle_height * sin, lift + ankle_height * cos + 0.75 * foot * sin])
+    return heel, ankle
 
 
 def _knee(hip: np.ndarray, ankle: np.ndarray, thigh: float, shank: float) -> np.ndarray:

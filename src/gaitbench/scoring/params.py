@@ -202,7 +202,7 @@ def compare_parameters(
     truth_params: pd.DataFrame,
     tolerance_s: float = 0.1,
     *,
-    group_by: Sequence[str] | None = ("detector",),
+    group_by: Sequence[str] | None = SOURCE_COLUMNS,
     parameters: Sequence[str] = PARAMETERS,
     valid_only: bool = True,
 ) -> pd.DataFrame:
@@ -218,7 +218,10 @@ def compare_parameters(
         As for :func:`pair_cycles`.
     group_by:
         Columns of the pairing table to group by: any of ``detector``,
-        ``backend``, ``tool``, ``tool_version``, ``clip_id``, ``side``.
+        ``backend``, ``tool``, ``tool_version``, ``clip_id``, ``side``. The
+        default, all four source columns, keeps apart the sources that
+        :func:`pair_cycles` pairs separately; leaving some out pools those
+        sources. Empty or None gives one row per parameter.
     parameters:
         Which of :data:`PARAMETERS` to report.
     valid_only:

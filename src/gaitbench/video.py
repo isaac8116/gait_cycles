@@ -79,7 +79,9 @@ def probe_video(path: str | Path, *, backend: str = "auto", timestamps: bool = T
         ``coded_width``, ``coded_height``, ``avg_fps``, ``frame_interval_s``
         (min/median/max), ``pix_fmt``, ``is_hdr``, ``device`` (iPhone model
         from QuickTime tags, if any), ``backend`` and ``notes`` (warnings
-        worth reading before running pose on the clip).
+        worth reading before running pose on the clip). With ffprobe also
+        ``start_time_s`` and ``file_start_s``: the first video timestamp and
+        the file's (they differ when the audio starts first).
 
     Raises
     ------
@@ -191,17 +193,29 @@ def cfr_command(
     crf: int = 18,
     preset: str = "medium",
     audio: bool = True,
+    video_start_s: float = 0.0,
     ffmpeg: str = "ffmpeg",
 ) -> list[str]:
     """ffmpeg command that writes a constant-frame-rate H.264 copy of a video.
 
-    The ``fps`` filter places output frames on an exact ``1/fps`` grid, taking
-    the source frame nearest each grid time (duplicating or dropping where
-    the source was irregular). Real time is preserved, so an unmodified
-    240 fps iPhone slow-motion original with ``fps=60`` gives a real-time
-    60 fps copy (every 4th frame). ffmpeg applies the rotation flag when
-    re-encoding, so the copy is upright. Audio is kept (re-encoded to AAC) for
-    clap synchronisation unless ``audio=False``.
+    The video is first moved to start at 0 (``setpts=PTS-STARTPTS``), then
+    the ``fps`` filter with ``round=up`` fills an exact ``1/fps`` grid: output
+    frame ``k`` shows the last source frame at or before ``k / fps`` after the
+    first source frame (duplicating or dropping where the source was
+    irregular). For an integer ratio this is exactly source frame
+    ``k * step`` when the stored times land on the output grid, as they do in
+    the iPhone's 1/600 s time base (a coarse 1/1000 s base, as in ``.mkv``,
+    can round a grid frame late and pick the one before it). So an
+    unmodified 240 fps iPhone slow-motion original with
+    ``fps=60`` gives a real-time 60 fps copy of frames 0, 4, 8, ..., and the
+    copy's :func:`frame_timestamps` are those frames' own times, so events
+    found on the copy score against labels made on the original. (ffmpeg's
+    default ``round=near`` would show frames 1, 5, 9, ... at the times of
+    0, 4, 8, ..., putting every event early by one source frame, and a video
+    that starts after the file's first timestamp would be padded with
+    repeated frames.) ffmpeg applies the rotation flag when re-encoding, so
+    the copy is upright. Audio is kept (re-encoded to AAC) for clap
+    synchronisation unless ``audio=False``.
 
     Parameters
     ----------
@@ -213,6 +227,12 @@ def cfr_command(
         x264 quality settings; 18 is visually lossless for pose estimation.
     audio:
         Keep the first audio stream if there is one.
+    video_start_s:
+        How long after the start of the file the first video frame comes
+        (:func:`probe_video`'s ``start_time_s - file_start_s``; ``gaitbench
+        cfr`` reads it with ffprobe). The audio is trimmed and shifted by the
+        same amount, so it stays in sync with the picture after the video is
+        moved to start at 0.
     ffmpeg:
         ffmpeg executable.
 
@@ -225,10 +245,67 @@ def cfr_command(
     cmd = [ffmpeg, "-hide_banner", "-y", "-i", str(src), "-map", "0:v:0"]
     if audio:
         cmd += ["-map", "0:a:0?"]
-    cmd += ["-vf", f"fps={rate}", "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
-    cmd += ["-c:a", "aac", "-b:a", "128k"] if audio else ["-an"]
+    cmd += ["-vf", f"setpts=PTS-STARTPTS,fps={rate}:round=up", "-c:v", "libx264", "-preset", preset,
+            "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
+    if audio:
+        offset = float(video_start_s)
+        if not np.isfinite(offset) or offset < 0:
+            raise ValueError(f"video_start_s must be a finite number >= 0, got {video_start_s!r}")
+        if offset > 0:
+            cmd += ["-af", f"atrim=start={offset!r},asetpts=PTS-{offset!r}/TB"]
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+    else:
+        cmd += ["-an"]
     cmd += ["-movflags", "+faststart", str(dst)]
     return cmd
+
+
+def load_timestamps(
+    video_path: str | Path,
+    timestamps_csv: str | Path | None = None,
+) -> tuple[np.ndarray | None, str, np.ndarray | None]:
+    """Find the best per-frame times for a video; the labeller and the pose stage both use this.
+
+    Sharing one function keeps labels and keypoints on the same timeline,
+    which scoring by time depends on. In order: a RealSense frames CSV next
+    to the video (``<stem>.frames.csv``, written by
+    :func:`gaitbench.capture.realsense.bag_to_video`; the ``.mp4`` itself is
+    written at a constant nominal rate and cannot show dropped frames), then
+    :func:`frame_timestamps`, then nothing (the caller falls back to
+    ``frame / fps``).
+
+    Parameters
+    ----------
+    video_path:
+        The video.
+    timestamps_csv:
+        A RealSense frames CSV to use (default: the one next to the video, if any).
+
+    Returns
+    -------
+    times:
+        ``(n_frames,)`` seconds from the first frame, or None if only the
+        nominal frame rate is available.
+    source:
+        ``"realsense:<file>"``, ``"video"`` or ``"nominal"``.
+    container_times:
+        The container's own frame times (for checking seeks), or None.
+    """
+    import warnings
+
+    from .capture.realsense import frame_times_path, read_frame_times
+
+    video_path = Path(video_path)
+    csv = Path(timestamps_csv) if timestamps_csv is not None else frame_times_path(video_path)
+    if timestamps_csv is not None or csv.is_file():
+        table = read_frame_times(csv)
+        return table["time_s"].to_numpy(dtype=float), f"realsense:{csv.name}", None
+    try:
+        ts = frame_timestamps(video_path)
+    except (RuntimeError, OSError, ValueError) as exc:
+        warnings.warn(f"Could not read frame times of {video_path} ({exc}); using frame / fps", stacklevel=2)
+        return None, "nominal", None
+    return np.asarray(ts, dtype=float), "video", np.asarray(ts, dtype=float)
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +405,7 @@ def _probe_ffprobe(path: Path) -> dict[str, Any]:
         "is_hdr": transfer in _HDR_TRANSFERS,
         "time_base": video.get("time_base"),
         "start_time_s": _float(video.get("start_time")),
+        "file_start_s": _float(fmt.get("start_time")),
         "container": fmt.get("format_name"),
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
         "creation_time": tags.get("creation_time"),

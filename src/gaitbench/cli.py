@@ -13,6 +13,7 @@ Commands, in pipeline order:
 * ``import-openpose``  OpenPose JSON directory -> keypoints
 * ``pose``             video -> keypoints with a CPU pose model through myogait
 * ``decimate``         keep every n-th keypoint frame (240 fps -> 60/30 fps copies)
+* ``clean``            fix leg swaps in keypoints -> ``<backend>-clean`` copies
 * ``detect``           keypoints -> events, one file per detector
 * ``score``            events vs labels -> matches, metrics, temporal parameters
 * ``agree``            events vs a reference detector, when there is no truth
@@ -51,6 +52,7 @@ from . import __version__
 from .formats import (
     FormatError,
     Keypoints,
+    empty_events,
     events_path,
     frames_to_times,
     keypoints_path,
@@ -58,6 +60,7 @@ from .formats import (
     read_events,
     read_labels,
     safe_name,
+    sample_rate,
     write_events,
     write_labels,
 )
@@ -71,15 +74,17 @@ DEFAULT_RESULTS_ROOT = Path("results") / "runs"
 
 # Columns printed in summary tables (whichever exist).
 _SUMMARY_COLUMNS: tuple[str, ...] = (
-    "backend", "ref_detector", "detector", "event", "n_truth", "n_pred", "recall", "precision", "f1",
+    "backend", "ref_detector", "detector", "event", "n_clips_missing", "n_truth", "n_pred", "recall", "precision", "f1",
     "bias_ms", "sd_ms", "mae_ms", "mae_frames", "p_within_1_frame", "p_within_2_frames",
 )
 
 _CONFIG_KEYS = {
-    "run_id", "description", "data_root", "results_root", "simulate", "import_openpose", "clips", "backends",
-    "detectors", "detector_params", "truth_rater", "reference_detector", "tolerance_ms", "restrict_to_truth_span",
-    "plots", "skip_existing",
+    "run_id", "description", "data_root", "results_root", "simulate", "import_openpose", "clean", "clips",
+    "backends", "detectors", "detector_params", "truth_rater", "reference_detector", "tolerance_ms",
+    "restrict_to_truth_span", "plots", "skip_existing",
 }
+# Detector specs that select groups of detectors rather than name one.
+_DETECTOR_GROUPS = frozenset({"all", "ours", "myogait"})
 
 
 class CLIError(RuntimeError):
@@ -110,7 +115,7 @@ def keypoint_files(
 ) -> list[DataFile]:
     """Keypoints files under ``<data>/keypoints``, optionally filtered by clip and backend."""
     out = []
-    for path in sorted((Path(data) / "keypoints").glob("*__*.npz")):
+    for path in _data_paths(Path(data) / "keypoints", "*__*.npz"):
         clip, backend = path.stem.rsplit("__", 1)
         out.append(DataFile(path, clip, backend))
     return [f for f in out if _keep(f.clip, clips) and _keep(f.backend, backends)]
@@ -124,7 +129,7 @@ def event_files(
 ) -> list[DataFile]:
     """Events files under ``<data>/events``; ``detectors`` filters on the safe detector name."""
     out = []
-    for path in sorted((Path(data) / "events").glob("*__*__*.csv")):
+    for path in _data_paths(Path(data) / "events", "*__*__*.csv"):
         clip, backend, detector = path.stem.rsplit("__", 2)
         out.append(DataFile(path, clip, backend, detector))
     return [
@@ -137,9 +142,19 @@ def label_files(data: str | Path, rater: str, clips: Sequence[str] | None = None
     """Labels files of one rater under ``<data>/labels``."""
     suffix = "__" + safe_name(rater) + ".csv"
     out = []
-    for path in sorted((Path(data) / "labels").glob("*" + suffix)):
+    for path in _data_paths(Path(data) / "labels", "*" + suffix):
         out.append(DataFile(path, path.name[: -len(suffix)], safe_name(rater)))
     return [f for f in out if _keep(f.clip, clips)]
+
+
+def _data_paths(directory: Path, pattern: str) -> list[Path]:
+    """Files matching ``pattern``, sorted, without hidden ones.
+
+    macOS writes ``._<name>`` AppleDouble files next to every file copied to
+    an exFAT drive or network share; they match the data patterns but are
+    not data, and reading one aborts the whole command.
+    """
+    return sorted(p for p in directory.glob(pattern) if not p.name.startswith("."))
 
 
 def _keep(part: str, wanted: Sequence[str] | None) -> bool:
@@ -301,8 +316,14 @@ def detect_all(
     """Run every detector on every selected keypoints file and write the events files.
 
     A detector that raises is recorded and skipped; the others still run.
+    Its events file from any earlier run is deleted, so it cannot be scored
+    as this run's result; scoring counts the clip's labels as missed instead.
     An empty result is still written (as a header-only file) so that scoring
     counts the clip's events as missed rather than ignoring the detector.
+
+    Events are named by the backend in the keypoints *file name*, which is
+    what the other stages select on; if ``meta['backend']`` says otherwise
+    (a renamed file), that is warned about and the file name wins.
 
     Returns
     -------
@@ -330,7 +351,12 @@ def detect_all(
             raise CLIError(f"Detector {name!r}: {exc.args[0] if exc.args else exc}") from exc
     for f in files:
         kp = Keypoints.load(f.path)
-        backend = str(kp.meta.get("backend", "")) or f.backend
+        named = str(kp.meta.get("backend", ""))
+        backend = named if named and _is_safe_form(named, f.backend) else f.backend
+        if named and backend != named:
+            warnings.warn(f"{f.path.name}: meta['backend'] is {named!r} but the file name says {f.backend!r}; "
+                          f"its events are named {f.backend!r}", stacklevel=2)
+        kp.meta["backend"] = backend  # detectors copy it into the events' backend column
         for name, runner in runners.items():
             out = events_path(data, kp.clip_id, backend, name)
             if skip_existing and out.exists():
@@ -342,6 +368,7 @@ def detect_all(
                     warnings.simplefilter("always")
                     events = runner(kp)
             except Exception as exc:  # one detector failing must not stop the sweep
+                out.unlink(missing_ok=True)
                 failures.append(_failure(kp.clip_id, backend, name, exc))
                 echo(f"  FAILED {kp.clip_id} / {backend} / {name}: {type(exc).__name__}: {exc}")
                 continue
@@ -372,7 +399,16 @@ def score_events(
     """Score every events file of every labelled clip against one rater's labels.
 
     Each events file is matched on its own (:func:`gaitbench.scoring.match_events`),
-    so an empty file still counts its clip's labels as missed.
+    so an empty file still counts its clip's labels as missed. So does a
+    missing file: every source (backend and detector) is scored on every
+    labelled clip where its backend is present, and a clip with no events
+    file from it (the detector crashed there, or was not run) adds all its
+    labels as FN, so every detector of a backend has the same denominator.
+    The sources are the detectors named in ``detectors`` (groups such as
+    ``ours`` only select files) on every backend, plus every backend and
+    detector with an events file on any labelled clip. A backend is present
+    on a clip if it has keypoints or events there, or is named in
+    ``backends``.
 
     Returns
     -------
@@ -380,10 +416,13 @@ def score_events(
         ``matches`` (one row per TP/FP/FN), ``metrics`` (per backend,
         detector and event), ``metrics_by_side`` (also per side; near and
         far limbs differ) and ``params`` (temporal parameters vs truth, per
-        backend and detector). Frame-based columns use each keypoints file's
-        sample rate.
+        backend and detector, on the same clips as the metrics). ``metrics``
+        and ``metrics_by_side`` give each source's ``n_clips`` (labelled
+        clips scored) and ``n_clips_missing`` (of those, clips without its
+        events file). Frame-based columns use each keypoints file's sample
+        rate.
     """
-    from .scoring import compare_parameters, match_events, temporal_parameters
+    from .scoring import match_events
 
     labels = label_files(data, rater, clips)
     if not labels:
@@ -391,33 +430,70 @@ def score_events(
     keep = detector_filter(detectors)
     names = _known_names()
     kp_cache: dict[tuple[str, str], Keypoints | None] = {}
-    match_parts, preds, truths, rates = [], [], [], []
+
+    # Read every events file first, so a source missing on one clip is named as its files elsewhere are.
+    backend_names: dict[str, str] = {}
+    detector_names: dict[str, str] = {}
+    clip_rows = []
     for lab in labels:
         truth = read_labels(lab.path)
         clip_id = _clip_id(truth, lab.clip)
         truth = truth.assign(clip_id=clip_id)
         truth = _with_times(truth, lambda: _any_keypoints(data, lab.clip, kp_cache), lab.path)
-        truths.append(truth)
-        files = event_files(data, [lab.clip], backends, keep)
-        if not files:
-            warnings.warn(f"{clip_id}: labelled by {rater!r} but has no events files", stacklevel=2)
-        for ef in files:
+        tables = {}
+        for ef in event_files(data, [lab.clip], backends, keep):
             pred, backend, detector = _read_source(ef, clip_id, names)
-            kp = _keypoints(data, ef.clip, ef.backend, kp_cache)
-            pred = _with_times(pred, lambda: kp, ef.path)
+            backend_names.setdefault(ef.backend, backend)
+            detector_names.setdefault(ef.detector, detector)
+            tables[(ef.backend, ef.detector)] = (ef, pred, backend, detector)
+        present = {f.backend for f in keypoint_files(data, [lab.clip], backends)} | {b for b, _ in tables}
+        present |= {safe_name(b) for b in backends or []}
+        clip_rows.append((lab, clip_id, truth, tables, present))
+    seen = {key for row in clip_rows for key in row[3]}
+    requested = []
+    for name in _spec_items(detectors):
+        if name in _DETECTOR_GROUPS:
+            continue
+        if safe_name(name) not in names and not any(d == safe_name(name) for _, d in seen):
+            warnings.warn(f"Detector {name!r} is not installed and has no events files; not scored", stacklevel=2)
+            continue
+        requested.append(safe_name(name))
+        detector_names.setdefault(safe_name(name), name)
+
+    match_parts, preds, truths, rates, coverage = [], [], [], [], []
+    for lab, clip_id, truth, tables, present in clip_rows:
+        truths.append(truth)
+        expected = {(b, d) for b in present for d in requested} | {(b, d) for b, d in seen if b in present}
+        if not expected:
+            warnings.warn(f"{clip_id}: labelled by {rater!r} but has no events files", stacklevel=2)
+        for b, d in sorted(expected):
+            kp = _keypoints(data, lab.clip, b, kp_cache)
+            if (b, d) in tables:
+                ef, pred, backend, detector = tables[(b, d)]
+                pred = _with_times(pred, lambda: kp, ef.path)
+            else:
+                pred = empty_events()
+                backend, detector = backend_names.get(b, b), detector_names.get(d, names.get(d, d))
             m = match_events(pred, truth, tolerance_s=tolerance_s, restrict_to_truth_span=restrict_to_truth_span)
             match_parts.append(_fill_source(m, clip_id, backend, detector))
-            preds.append(pred)
-            rates.append((backend, clip_id, _sample_rate(kp)))
+            # Named like the matches, so the parameters keep files (and empty ones) apart.
+            preds.append(_fill_source(pred, clip_id, backend, detector))
+            rates.append(_rate_entry(backend, clip_id, kp))
+            coverage.append({"backend": backend, "detector": detector, "clip_id": clip_id,
+                             "missing": (b, d) not in tables})
     if not match_parts:
         raise CLIError(f"No events files for the clips labelled by {rater!r}; run `gaitbench detect` first")
 
     matches = pd.concat(match_parts, ignore_index=True)
-    metrics = _metrics_per_backend(matches, rates, ("backend", "detector", "event"))
-    by_side = _metrics_per_backend(matches, rates, ("backend", "detector", "side", "event"))
-    pred_params = temporal_parameters(pd.concat(preds, ignore_index=True))
-    truth_params = temporal_parameters(pd.concat(truths, ignore_index=True))
-    params = compare_parameters(pred_params, truth_params, tolerance_s=tolerance_s, group_by=("backend", "detector"))
+    covered = pd.DataFrame(coverage)
+    for (backend, detector), grp in covered[covered["missing"]].groupby(["backend", "detector"], sort=True):
+        warnings.warn(f"{backend} / {detector}: no events file for labelled clip(s) {sorted(grp['clip_id'])}; "
+                      "their labels count as missed (see n_clips_missing)", stacklevel=2)
+    counts = covered.groupby(["backend", "detector"], sort=True).agg(
+        n_clips=("clip_id", "size"), n_clips_missing=("missing", "sum")).reset_index()
+    metrics = _with_counts(_metrics_per_backend(matches, rates, ("backend", "detector", "event")), counts, 3)
+    by_side = _with_counts(_metrics_per_backend(matches, rates, ("backend", "detector", "side", "event")), counts, 4)
+    params = _parameters_per_source(preds, truths, covered, tolerance_s)
     return {"matches": matches, "metrics": metrics, "metrics_by_side": by_side, "params": params}
 
 
@@ -471,7 +547,7 @@ def agree_events(
             m["ref_detector"] = m["ref_detector"].where(m["ref_detector"] != "", ref_name)
             m["ref_backend"] = m["ref_backend"].where(m["ref_backend"] != "", backend)
             parts.append(m)
-        rates.append((backend, clip_id, _sample_rate(kp)))
+        rates.append(_rate_entry(backend, clip_id, kp))
     if not parts:
         raise CLIError(f"Nothing to compare: no clip has events from both {reference!r} and another detector")
     matches = pd.concat(parts, ignore_index=True)
@@ -511,27 +587,92 @@ def plot_clips(
 
 
 def decimate_keypoints(kp: Keypoints, step: int, offset: int = 0, backend: str | None = None) -> Keypoints:
-    """Keep every ``step``-th frame, starting at array position ``offset``.
+    """Keep the frames whose source-video index is ``offset`` modulo ``step``.
 
+    Frames are chosen by ``frame_idx``, not by position in the file, so the
+    copies made from different backends of one clip hold the same source
+    frames even when the backends' keypoints start on different frames
+    (myogait trims each backend to where it first sees the legs).
     ``frame_idx`` and ``time_s`` keep their source-video values, so events
-    found on the copy are in the frame numbering and timeline of the original
-    video and score directly against labels made on it (e.g. 240 fps
-    slow-motion labels). The copy is named ``<backend>-<rate>fps`` unless
+    found on the copy are in the frame numbering and timeline of the
+    original video and score directly against labels made on it (e.g.
+    240 fps slow-motion labels). The copy is named ``<backend>-<rate>fps``
+    from its own sample rate (:func:`gaitbench.formats.sample_rate`) unless
     ``backend`` is given. Keypoints are subsampled, not re-estimated: pose
     models that smooth over time (MediaPipe video mode) would give slightly
     different points on a real lower-rate video.
     """
     if step < 1 or not 0 <= offset < step:
         raise ValueError(f"need step >= 1 and 0 <= offset < step, got step={step}, offset={offset}")
-    rate = _sample_rate(kp) or kp.fps
-    new_rate = rate / step
+    keep = (kp.frame_idx - offset) % step == 0
+    if not keep.any():
+        raise ValueError(f"{kp.clip_id}: no frame has frame_idx % {step} == {offset}")
+    new_rate = sample_rate(kp.time_s[keep], nominal=kp.fps / step)
     src_backend = str(kp.meta.get("backend", "")) or "unknown"
     name = backend or f"{src_backend}-{new_rate:.0f}fps"
-    sel = slice(offset, None, step)
     meta = {**kp.meta, "fps": float(kp.fps) / step, "backend": name, "decimated_from": src_backend,
             "decimate_step": int(step), "decimate_offset": int(offset)}
-    return Keypoints(clip_id=kp.clip_id, names=kp.names, xy=kp.xy[sel], conf=kp.conf[sel], time_s=kp.time_s[sel],
-                     frame_idx=kp.frame_idx[sel], meta=meta)
+    return Keypoints(clip_id=kp.clip_id, names=kp.names, xy=kp.xy[keep], conf=kp.conf[keep], time_s=kp.time_s[keep],
+                     frame_idx=kp.frame_idx[keep], meta=meta)
+
+
+def clean_all(
+    data: str | Path,
+    *,
+    clips: Sequence[str] | None = None,
+    backends: Sequence[str] | None = None,
+    steps: Sequence[str] = ("leg_swaps",),
+    params: Mapping[str, Mapping[str, Any]] | None = None,
+    report_dir: str | Path | None = None,
+    echo: Callable[[str], None] = print,
+) -> pd.DataFrame:
+    """Clean every selected keypoints file into a ``<backend>-clean`` copy (:mod:`gaitbench.clean`).
+
+    Each ``<data>/keypoints/<clip>__<backend>.npz`` gets a cleaned
+    ``<clip>__<backend>-clean.npz`` beside it, which the later stages see as
+    one more backend, so raw and cleaned keypoints are detected and scored
+    side by side. Files whose backend already ends in ``-clean`` are
+    skipped. With ``report_dir`` the per-frame report of each file is
+    written there as ``<clip>__<backend>.csv``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per cleaned file: ``clip_id``, ``backend``,
+        ``cleaned_backend``, ``n_frames``, ``n_swapped``, ``n_dropped``
+        (frames with a copied leg removed; 0 without the ``leg_swaps``
+        step), ``path`` and ``report``.
+
+    Raises
+    ------
+    CLIError
+        If no file matches, or cleaning a file fails (a wrong step or
+        parameter name fails on the first file, before anything is written).
+    """
+    from .clean import CLEAN_SUFFIX, clean_keypoints_file, cleaned_backend_name
+
+    files = [f for f in keypoint_files(data, clips, backends) if not f.backend.endswith(CLEAN_SUFFIX)]
+    if not files:
+        raise CLIError(f"No keypoints files to clean in {Path(data) / 'keypoints'} match clips={clips} "
+                       f"backends={backends} (files already ending in {CLEAN_SUFFIX!r} are skipped)")
+    rows = []
+    for f in files:
+        cleaned_backend = cleaned_backend_name(f.backend)
+        out = f.path.with_name(f"{f.clip}__{cleaned_backend}.npz")
+        report = Path(report_dir) / f"{f.clip}__{f.backend}.csv" if report_dir is not None else None
+        try:
+            table = clean_keypoints_file(f.path, out, list(steps), step_params=params, report_path=report)
+        except (TypeError, ValueError) as exc:
+            raise CLIError(f"clean {f.path.name}: {exc}") from exc
+        done = dict(Keypoints.load(out).meta.get("cleaned", {}).get("leg_swaps") or {})
+        rows.append({"clip_id": f.clip, "backend": f.backend, "cleaned_backend": cleaned_backend,
+                     "n_frames": int(table["frame"].nunique()), "n_swapped": int(done.get("n_swapped", 0)),
+                     "n_dropped": int(done.get("n_dropped", 0)), "path": str(out),
+                     "report": str(report) if report is not None else ""})
+        echo(f"  {f.clip} / {f.backend} -> {cleaned_backend}: {rows[-1]['n_swapped']} frame(s) swapped, "
+             f"{rows[-1]['n_dropped']} with a copied leg removed")
+    return pd.DataFrame(rows, columns=["clip_id", "backend", "cleaned_backend", "n_frames", "n_swapped",
+                                       "n_dropped", "path", "report"])
 
 
 def run_config(config: str | Path | Mapping[str, Any], *, run_id: str | None = None, overwrite: bool = False,
@@ -541,8 +682,12 @@ def run_config(config: str | Path | Mapping[str, Any], *, run_id: str | None = N
     Config keys: ``run_id``, ``data_root`` (required); ``results_root``
     (default ``results/runs``); ``simulate`` (list of :func:`simulate_clip`
     keyword dicts, written first); ``import_openpose`` (list of
-    :func:`import_openpose` keyword dicts); ``clips``, ``backends`` (list or
-    ``all``); ``detectors`` (spec, see :func:`expand_detectors`);
+    :func:`import_openpose` keyword dicts); ``clean`` (``{steps: [leg_swaps],
+    params: {leg_swaps: {...}}}``, run after those and before detection, see
+    :func:`clean_all`; with an explicit ``backends`` list the ``-clean``
+    copies are added to it, so raw and cleaned keypoints are both scored);
+    ``clips``, ``backends`` (list or ``all``); ``detectors`` (spec, see
+    :func:`expand_detectors`);
     ``detector_params`` (``{detector: {param: value}}``); ``truth_rater``
     (labels to score against, or null); ``reference_detector`` (for
     agreement; used when there is no truth, or in addition to it);
@@ -550,8 +695,11 @@ def run_config(config: str | Path | Mapping[str, Any], *, run_id: str | None = N
     true); ``plots`` (write signal plots into the run directory);
     ``skip_existing`` (reuse events files already in the data root).
 
-    The run directory gets ``config.yaml`` (the config as run, with the
-    expanded detector list), ``env.json`` (:func:`gaitbench.env.snapshot`),
+    The run directory is emptied first when ``overwrite`` is set, so nothing
+    from an earlier run is left beside the new record. It gets
+    ``config.yaml`` (the config as run, with the expanded detector and
+    backend lists), ``env.json`` (:func:`gaitbench.env.snapshot`), with
+    ``clean`` a ``clean.csv`` summary and per-file reports in ``clean/``,
     ``detect.csv`` and ``failures.csv``, then with truth ``matches.csv``,
     ``metrics.csv``, ``metrics_by_side.csv``, ``params.csv``, and with a
     reference ``agreement.csv`` and ``agreement_matches.csv``. Agreement is
@@ -567,6 +715,8 @@ def run_config(config: str | Path | Mapping[str, Any], *, run_id: str | None = N
     if unknown:
         warnings.warn(f"Unknown config keys ignored: {unknown}", stacklevel=2)
     data = Path(cfg["data_root"])
+    if safe_name(run_id) in (".", ".."):
+        raise CLIError(f"run_id {run_id!r} is not a usable directory name")
     out_dir = Path(cfg.get("results_root") or DEFAULT_RESULTS_ROOT) / safe_name(run_id)
     if out_dir.exists() and any(out_dir.iterdir()) and not overwrite:
         raise CLIError(f"{out_dir} already exists; choose another run_id or pass --overwrite")
@@ -577,6 +727,15 @@ def run_config(config: str | Path | Mapping[str, Any], *, run_id: str | None = N
     reference = cfg.get("reference_detector")
     if reference and reference not in detectors:
         raise CLIError(f"reference_detector {reference!r} is not among the detectors run: {detectors}")
+    clean = _clean_config(cfg.get("clean"))
+    raw_backends = backends
+    if clean is not None and backends is not None:
+        from .clean import CLEAN_SUFFIX, cleaned_backend_name
+
+        added = [cleaned_backend_name(b) for b in backends if not safe_name(b).endswith(CLEAN_SUFFIX)]
+        backends = list(dict.fromkeys([*backends, *added]))
+    if overwrite and out_dir.exists():
+        _empty_run_dir(out_dir, data)
 
     for spec in cfg.get("simulate") or []:
         spec = dict(spec)
@@ -588,10 +747,17 @@ def run_config(config: str | Path | Mapping[str, Any], *, run_id: str | None = N
 
     # The record goes in first, so that a run that fails later still says what was attempted.
     out_dir.mkdir(parents=True, exist_ok=True)
-    record = {**cfg, "run_id": run_id, "detectors_expanded": detectors, "gaitbench_version": __version__,
-              "data_root_resolved": str(data.resolve())}
+    record = {**cfg, "run_id": run_id, "detectors_expanded": detectors, "backends_expanded": backends,
+              "gaitbench_version": __version__, "data_root_resolved": str(data.resolve())}
     _write_yaml(record, out_dir / "config.yaml")
     (out_dir / "env.json").write_text(json.dumps(snapshot(), indent=2) + "\n")
+
+    if clean is not None:
+        steps, step_params = clean
+        echo(f"clean: {', '.join(steps)} on {data}")
+        cleaned = clean_all(data, clips=clips, backends=raw_backends, steps=steps, params=step_params,
+                            report_dir=out_dir / "clean", echo=echo)
+        cleaned.to_csv(out_dir / "clean.csv", index=False)
 
     echo(f"detect: {len(detectors)} detector(s) on {data}")
     done, failures = detect_all(data, detectors, clips=clips, backends=backends, params=cfg.get("detector_params"),
@@ -672,6 +838,14 @@ def _read_source(f: DataFile, clip_id: str | None, names: Mapping[str, str]) -> 
     return table, backend, detector
 
 
+def _is_safe_form(name: str, safe: str) -> bool:
+    """True if ``safe`` is the filename-safe form of ``name``."""
+    try:
+        return safe_name(name) == safe
+    except FormatError:
+        return False
+
+
 def _single(table: pd.DataFrame, col: str) -> str:
     values = [v for v in table[col].astype(str).unique() if v] if col in table.columns else []
     return values[0] if len(values) == 1 else ""
@@ -717,29 +891,80 @@ def _with_times(events: pd.DataFrame, get_kp: Callable[[], Keypoints | None], so
 
 
 def _sample_rate(kp: Keypoints | None) -> float | None:
+    """The rate the keypoints were sampled at (:attr:`Keypoints.rate`), or None if unknown."""
     if kp is None:
         return None
-    if kp.n_frames > 1:
-        return float(1.0 / np.median(np.diff(kp.time_s)))
-    return float(kp.fps)
+    try:
+        return kp.rate
+    except FormatError:  # one frame and no meta['fps']
+        return None
 
 
-def _metrics_per_backend(matches: pd.DataFrame, rates: Iterable[tuple[str, str, float | None]],
+def _rate_entry(backend: str, clip_id: str, kp: Keypoints | None) -> tuple[str, str, float | None, float]:
+    """``(backend, clip, rate, timestamp slack)`` for frame-based metrics of one scored stream."""
+    from .scoring import timestamp_slack
+
+    rate = _sample_rate(kp)
+    slack = timestamp_slack(kp.time_s, rate) if kp is not None and rate else 0.0
+    return backend, clip_id, rate, slack
+
+
+def _metrics_per_backend(matches: pd.DataFrame, rates: Iterable[tuple[str, str, float | None, float]],
                          group_by: Sequence[str]) -> pd.DataFrame:
-    """event_metrics with each backend's own frame rate (a decimated copy has a lower one)."""
+    """event_metrics with each backend's own frame rate (a decimated copy has a lower one).
+
+    "Within k frames" uses the scored stream's own frame period plus its
+    timestamp quantisation (240 fps iPhone video in a 1/600 s time base has
+    intervals of 3.33 and 5 ms around the 4.17 ms period), so an event one
+    frame off counts as within one frame.
+    """
     from .scoring import event_metrics
 
-    by_backend: dict[str, dict[str, float | None]] = {}
-    for backend, clip_id, rate in rates:
-        by_backend.setdefault(backend, {})[clip_id] = rate
+    by_backend: dict[str, dict[str, tuple[float | None, float]]] = {}
+    for backend, clip_id, rate, slack in rates:
+        by_backend.setdefault(backend, {})[clip_id] = (rate, slack)
     parts = []
     for backend, sub in matches.groupby("backend", sort=True):
         clip_rates = by_backend.get(backend, {})
-        fps: dict[str, float] | None = {c: float(r) for c, r in clip_rates.items() if r}
-        if not fps or set(sub["clip_id"]) - set(fps):
-            fps = None
-        parts.append(event_metrics(sub, fps=fps, group_by=group_by))
+        fps: dict[str, float] | None = {c: float(r) for c, (r, _) in clip_rates.items() if r}
+        slack = {c: float(sl) for c, (r, sl) in clip_rates.items() if r}
+        unrated = set(sub["clip_id"]) - set(fps or {})
+        if fps and unrated and not unrated & set(sub.loc[sub["status"] == "TP", "clip_id"]):
+            # Clips with no keypoints and no hits (all missed) have no errors to count in frames.
+            fps.update(dict.fromkeys(unrated, next(iter(fps.values()))))
+            slack.update(dict.fromkeys(unrated, 0.0))
+        elif not fps or unrated:
+            fps, slack = None, {}
+        parts.append(event_metrics(sub, fps=fps, slack_s=slack if fps else 0.0, group_by=group_by))
     return pd.concat(parts, ignore_index=True) if parts else event_metrics(matches, group_by=group_by)
+
+
+def _with_counts(metrics: pd.DataFrame, counts: pd.DataFrame, n_group: int) -> pd.DataFrame:
+    """Add each source's ``n_clips`` and ``n_clips_missing`` after the first ``n_group`` columns."""
+    out = metrics.merge(counts, on=["backend", "detector"], how="left")
+    first = list(metrics.columns[:n_group]) + ["n_clips", "n_clips_missing"]
+    return out.loc[:, first + [c for c in metrics.columns if c not in first]]
+
+
+def _parameters_per_source(preds: list[pd.DataFrame], truths: list[pd.DataFrame], covered: pd.DataFrame,
+                           tolerance_s: float) -> pd.DataFrame:
+    """Temporal parameters vs truth for each scored source, on exactly the clips it was scored on.
+
+    One source at a time, so a source with no cycles at all still gets its
+    row (all truth cycles missed) instead of vanishing from the table.
+    """
+    from .scoring import compare_parameters, temporal_parameters
+
+    pred_params = temporal_parameters(pd.concat(preds, ignore_index=True))
+    truth_params = temporal_parameters(pd.concat(truths, ignore_index=True))
+    parts = []
+    for (backend, detector), grp in covered.groupby(["backend", "detector"], sort=True):
+        own = pred_params[(pred_params["backend"] == backend) & (pred_params["detector"] == detector)]
+        truth = truth_params[truth_params["clip_id"].isin(set(grp["clip_id"]))]
+        part = compare_parameters(own, truth, tolerance_s=tolerance_s, group_by=("backend", "detector"))
+        # With no predicted cycles the FN rows come back with blank source columns.
+        parts.append(part.assign(backend=backend, detector=detector))
+    return pd.concat(parts, ignore_index=True)
 
 
 def _parse_direction(value: int | str) -> int:
@@ -749,6 +974,37 @@ def _parse_direction(value: int | str) -> int:
     if text in ("-1", "rtl", "right_to_left", "right-to-left"):
         return -1
     raise CLIError(f"direction must be +1/-1 or ltr/rtl, got {value!r}")
+
+
+def _clean_config(value: Any) -> tuple[list[str], dict[str, dict[str, Any]]] | None:
+    """The ``clean`` section of a run config as ``(steps, params)``, or None when absent or off."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        value = {}
+    if not isinstance(value, Mapping):
+        raise CLIError(f"clean must be a mapping like {{steps: [leg_swaps], params: {{}}}}, got {value!r}")
+    unknown = sorted(set(value) - {"steps", "params"})
+    if unknown:
+        raise CLIError(f"Unknown keys in clean: {unknown} (expected steps, params)")
+    steps = _spec_items(value.get("steps") or ["leg_swaps"])
+    params = value.get("params") or {}
+    if not isinstance(params, Mapping) or not all(isinstance(v, Mapping) or v is None for v in params.values()):
+        raise CLIError(f"clean.params must map step names to parameter mappings, got {params!r}")
+    return steps, {str(k): dict(v or {}) for k, v in params.items()}
+
+
+def _empty_run_dir(out_dir: Path, data: Path) -> None:
+    """Delete everything in a run directory, so no earlier result sits beside the new record."""
+    run = out_dir.resolve()
+    root = data.resolve()
+    if run == root or run in root.parents:
+        raise CLIError(f"data_root {data} is inside the run directory {out_dir}; refusing to empty it")
+    for child in run.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def _all_or_list(value: Any) -> list[str] | None:
@@ -826,27 +1082,27 @@ def _cmd_import_openpose(args: argparse.Namespace) -> int:
 
 
 def _cmd_pose(args: argparse.Namespace) -> int:
-    from .video import frame_timestamps, probe_video
+    from .video import load_timestamps, probe_video
 
     bridge = _lazy("gaitbench.myogait_bridge", "The pose stage", "pip install 'gaitbench[myogait,pose]'")
     video = Path(args.video)
     clip_id = args.clip_id or video.stem
+    backend = args.out_backend or args.backend
     info = probe_video(video, timestamps=False)
     for note in info.get("notes", []):
         print(f"note: {note}")
-    timestamps, n_measured = None, 0
+    timestamps, n_measured, time_source = None, 0, "nominal"
     if not args.nominal_time:
-        try:
-            measured = frame_timestamps(video)
-        except (RuntimeError, OSError) as exc:
-            warnings.warn(f"Could not read frame timestamps ({exc}); using frame_idx / fps", stacklevel=1)
-        else:
+        # The labeller's timeline (RealSense frames CSV first), so labels and keypoints agree.
+        measured, time_source, _ = load_timestamps(video)
+        if measured is not None:
             n_measured = len(measured)
             # OpenCV can decode a frame or two more than ffprobe lists; extrapolate those
             # rather than lose the whole pose run to a length mismatch.
-            step = float(np.median(np.diff(measured))) if n_measured > 1 else 1.0 / (info.get("fps_nominal") or 30.0)
+            nominal = info.get("fps_nominal") or 30.0
+            rate = sample_rate(measured, nominal=nominal) if n_measured > 1 else nominal
             pad = max(10, n_measured // 20)
-            timestamps = np.concatenate([measured, measured[-1] + step * np.arange(1, pad + 1)])
+            timestamps = np.concatenate([measured, measured[-1] + np.arange(1, pad + 1) / rate])
     extra: dict[str, Any] = {}
     if args.max_frames:
         extra["max_frames"] = args.max_frames
@@ -856,7 +1112,9 @@ def _cmd_pose(args: argparse.Namespace) -> int:
                       "their times are extrapolated", stacklevel=1)
     kp.meta["video_probe"] = {k: info.get(k) for k in ("fps_nominal", "n_frames", "duration_s", "codec", "rotation",
                                                         "is_hdr", "device", "backend")}
-    out = kp.save(keypoints_path(args.data, clip_id, args.backend))
+    kp.meta["backend"] = backend
+    kp.meta["time_source"] = time_source
+    out = kp.save(keypoints_path(args.data, clip_id, backend))
     per_frame = kp.meta.get("pose_s_per_frame")
     print(f"{out}: {kp.n_frames} frames" + (f", {1000 * per_frame:.1f} ms/frame" if per_frame else ""))
     return 0
@@ -869,6 +1127,17 @@ def _cmd_decimate(args: argparse.Namespace) -> int:
     kp = decimate_keypoints(Keypoints.load(path), args.step, args.offset, args.out_backend)
     out = kp.save(keypoints_path(args.data, kp.clip_id, kp.meta["backend"]))
     print(f"{out}: {kp.n_frames} frames at {kp.fps:g} fps (backend {kp.meta['backend']!r})")
+    return 0
+
+
+def _cmd_clean(args: argparse.Namespace) -> int:
+    clips = None if not args.clip or "all" in args.clip else args.clip
+    backends = None if not args.backend or "all" in args.backend else args.backend
+    params = json.loads(args.params) if args.params else None
+    out = Path(args.out) if args.out else Path(args.data) / "results" / "clean"
+    done = clean_all(args.data, clips=clips, backends=backends, steps=_spec_items(args.steps), params=params,
+                     report_dir=out)
+    print(f"\n{len(done)} cleaned keypoints file(s) written; reports in {out}")
     return 0
 
 
@@ -939,9 +1208,18 @@ def _cmd_probe(args: argparse.Namespace) -> int:
 
 
 def _cmd_cfr(args: argparse.Namespace) -> int:
-    from .video import cfr_command
+    from .video import cfr_command, ffprobe_path, probe_video
 
-    cmd = cfr_command(args.src, args.dst, args.fps, crf=args.crf, audio=not args.no_audio)
+    video_start = 0.0
+    if not args.no_audio and ffprobe_path() is not None:
+        # The copy's video starts at 0; the audio must move by as much to stay in sync.
+        try:
+            info = probe_video(args.src, backend="ffprobe", timestamps=False)
+        except (RuntimeError, OSError, ValueError):
+            info = {}
+        if info.get("has_audio"):
+            video_start = max(0.0, (info.get("start_time_s") or 0.0) - (info.get("file_start_s") or 0.0))
+    cmd = cfr_command(args.src, args.dst, args.fps, crf=args.crf, audio=not args.no_audio, video_start_s=video_start)
     if not args.run:
         print(" ".join(_quote(c) for c in cmd))
         return 0
@@ -970,8 +1248,8 @@ def _cmd_label(args: argparse.Namespace) -> int:
 
 def _realsense() -> Any:
     return _lazy("gaitbench.capture.realsense", "RealSense capture",
-                 "Install pyrealsense2 (Linux/Windows) or pyrealsense2-macosx (Apple Silicon): "
-                 "pip install 'gaitbench[realsense]'")
+                 "Install pyrealsense2 (Linux/Windows) or pyrealsense2-macosx (Apple Silicon, macOS 15+): "
+                 "pip install 'gaitbench[realsense]'; on older macOS: conda install -c conda-forge pyrealsense2")
 
 
 def _cmd_realsense_modes(args: argparse.Namespace) -> int:
@@ -1020,9 +1298,16 @@ def _cmd_list_detectors(args: argparse.Namespace) -> int:
 
 
 def _cmd_env(args: argparse.Namespace) -> int:
-    from .env import snapshot
+    from .env import opencv_gui, snapshot
 
-    _print_json(snapshot())
+    info = snapshot()
+    info["opencv"] = cv = opencv_gui()
+    _print_json(info)
+    if cv is not None and not cv["has_gui"]:
+        print(f"warning: OpenCV {cv['version']} has no GUI (build information says GUI: {cv['gui']}), so "
+              "`gaitbench label` cannot open a window. opencv-python-headless (needed by myogait) was installed "
+              "after opencv-python. Repair it, without uninstalling anything (the OpenCV packages share files):\n"
+              f"  {cv['fix']}", file=sys.stderr)
     return 0
 
 
@@ -1097,6 +1382,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--video", required=True)
     p.add_argument("--clip-id", help="default: the video file name without extension")
     p.add_argument("--backend", default="mediapipe", help="myogait model: mediapipe, rtmw, yolo, ...")
+    p.add_argument("--out-backend",
+                   help="backend name of the keypoints (default: the model name). Name copies of a labelled clip "
+                        "differently, e.g. --clip-id IMG_1234 --out-backend mediapipe-cfr60 for a 60 fps copy")
     p.add_argument("--max-frames", type=int)
     p.add_argument("--nominal-time", action="store_true",
                    help="use frame_idx / fps instead of the video's real frame timestamps")
@@ -1107,9 +1395,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clip", required=True)
     p.add_argument("--backend", required=True)
     p.add_argument("--step", type=int, required=True)
-    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--offset", type=int, default=0,
+                   help="keep source frames with frame_idx %% step == offset (the same frames for every backend)")
     p.add_argument("--out-backend", help="backend name of the copy (default <backend>-<rate>fps)")
     p.set_defaults(func=_cmd_decimate)
+
+    p = sub.add_parser("clean", help="fix leg swaps in keypoints; writes <clip>__<backend>-clean.npz copies")
+    data_arg(p)
+    p.add_argument("--clip", action="append", help="clip id (repeatable; default or 'all': every clip)")
+    p.add_argument("--backend", action="append",
+                   help="backend (repeatable; default or 'all': every backend not already ending in -clean)")
+    p.add_argument("--steps", default="leg_swaps", help="comma list of cleaning steps (default leg_swaps)")
+    p.add_argument("--params", help='step parameters as JSON, e.g. \'{"leg_swaps": {"min_conf": 0.2}}\'')
+    p.add_argument("--out", help="directory for the per-frame reports (default <data>/results/clean)")
+    p.set_defaults(func=_cmd_clean)
 
     p = sub.add_parser("detect", help="run detectors on keypoints files and write events files")
     data_arg(p)
@@ -1147,7 +1446,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", help="detect + score/agree from a YAML config into results/runs/<run_id>/")
     p.add_argument("config")
     p.add_argument("--run-id", help="override the config's run_id")
-    p.add_argument("--overwrite", action="store_true", help="reuse an existing run directory")
+    p.add_argument("--overwrite", action="store_true", help="empty and reuse an existing run directory")
     p.set_defaults(func=_cmd_run)
 
     p = sub.add_parser("probe", help="print video facts (size, fps, VFR, rotation) as JSON")

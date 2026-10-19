@@ -81,6 +81,24 @@ def shift_frames(kp: Keypoints, scale: int = 1, offset: int = 0) -> Keypoints:
     )
 
 
+def decimate(kp: Keypoints, step: int) -> Keypoints:
+    """Every ``step``-th frame with source ``frame_idx`` and ``time_s`` kept, as ``gaitbench decimate`` does."""
+    sel = slice(None, None, step)
+    return Keypoints(
+        clip_id=kp.clip_id, names=kp.names, xy=kp.xy[sel], conf=kp.conf[sel],
+        time_s=kp.time_s[sel], frame_idx=kp.frame_idx[sel], meta={**kp.meta, "fps": kp.fps / step},
+    )
+
+
+def with_missing(kp: Keypoints, names, frames) -> Keypoints:
+    """Copy of ``kp`` with ``names`` missing (NaN, confidence 0) in ``frames``."""
+    xy, conf = kp.xy.copy(), kp.conf.copy()
+    for name in names:
+        j = kp.index(name)
+        xy[frames, j], conf[frames, j] = np.nan, 0.0
+    return Keypoints(kp.clip_id, kp.names, xy, conf, kp.time_s, kp.frame_idx, kp.meta)
+
+
 @pytest.fixture(scope="module")
 def clean_walk():
     return simulate_walk(fps=60.0, duration_s=6.0, clip_id="clean60")
@@ -153,7 +171,10 @@ def test_pivot_layout_matches_extract():
     for key in ("myogait_version", "meta", "subject", "extraction", "frames", "normalization", "angles", "events"):
         assert key in pivot
     assert pivot["meta"]["fps"] == 60.0 and pivot["meta"]["n_frames"] == kp.n_frames
-    assert (pivot["meta"]["width"], pivot["meta"]["height"]) == (1920, 1080)
+    # Square L x L frame (myogait 0.9.1 aspect-ratio workaround); the true size is kept.
+    assert (pivot["meta"]["width"], pivot["meta"]["height"]) == (1920, 1920)
+    stored = pivot["extraction"]["gaitbench"]["meta"]
+    assert (stored["width"], stored["height"]) == (1920, 1080)
     assert pivot["extraction"]["model"] == "synthetic"
     assert len(pivot["frames"]) == kp.n_frames
     assert pivot["frames"][5]["landmarks"] == {} and pivot["frames"][5]["confidence"] == 0.0
@@ -167,7 +188,7 @@ def test_pivot_layout_matches_extract():
     assert np.isnan(lm["LEFT_EYE"]["x"]) and lm["LEFT_EYE"]["visibility"] == 0.0
     j = kp.index("LEFT_ANKLE")
     assert lm["LEFT_ANKLE"]["x"] == pytest.approx(kp.xy[0, j, 0] / 1920)
-    assert lm["LEFT_ANKLE"]["y"] == pytest.approx(kp.xy[0, j, 1] / 1080)
+    assert lm["LEFT_ANKLE"]["y"] == pytest.approx(kp.xy[0, j, 1] / 1920)
     # A point dropped in a frame that has other points is NaN with visibility 0.
     rows, cols = np.where(np.isnan(kp.xy[:, :, 0]))
     for r, c in zip(rows, cols):
@@ -207,6 +228,25 @@ def test_foot_index_derived_from_toes_and_dropped_again():
     assert back.names == kp.names
     no_derive = mb.keypoints_to_pivot(kp, derive_foot_index=False)
     assert np.isnan(no_derive["frames"][0]["landmarks"]["LEFT_FOOT_INDEX"]["x"])
+
+
+def test_derived_foot_index_needs_both_toes():
+    # MGB-4: with one toe missing, FOOT_INDEX used to jump to the other toe; extract leaves a gap.
+    kp = simulate_walk(duration_s=0.5).keypoints
+    kp = kp.subset([n for n in kp.names if not n.endswith("FOOT_INDEX")])
+    kp = with_missing(kp, ["LEFT_SMALL_TOE"], [3])
+    kp.conf[4, kp.index("LEFT_BIG_TOE")] = 0.3
+    frames = mb.keypoints_to_pivot(kp)["frames"]
+    gap = frames[3]["landmarks"]["LEFT_FOOT_INDEX"]
+    assert np.isnan(gap["x"]) and np.isnan(gap["y"]) and gap["visibility"] == 0.0
+    mid = frames[4]["landmarks"]["LEFT_FOOT_INDEX"]
+    big, small = kp.point("LEFT_BIG_TOE")[4], kp.point("LEFT_SMALL_TOE")[4]
+    assert mid["x"] == pytest.approx((big[0] + small[0]) / 2 / 1920)
+    assert mid["y"] == pytest.approx((big[1] + small[1]) / 2 / 1920)
+    assert mid["visibility"] == pytest.approx(0.3)
+    # A backend with only one toe name gets no derived FOOT_INDEX at all.
+    one_toe = kp.subset([n for n in kp.names if not n.endswith("SMALL_TOE")])
+    assert np.isnan(mb.keypoints_to_pivot(one_toe)["frames"][0]["landmarks"]["LEFT_FOOT_INDEX"]["x"])
 
 
 def _extract_like_pivot(kp: Keypoints, *, flipped: bool) -> dict:
@@ -261,6 +301,21 @@ def test_pivot_from_subsampled_extract_scales_frame_idx():
     pivot["extraction"]["experimental"] = {"frame_stride": 4, "effective_fps": 15.0}
     back = mb.pivot_to_keypoints(pivot, "c", backend="mediapipe")
     np.testing.assert_array_equal(back.frame_idx, kp.frame_idx * 4)
+
+
+@pytest.mark.parametrize("width,height", [(1920, 1080), (1080, 1920), (960, 540)])
+def test_square_pivot_round_trip_keeps_true_frame_size(width, height):
+    # MGB-1 workaround: both axes divided by L = max(width, height); the true size comes back.
+    kp = simulate_walk(duration_s=0.5, width=width, height=height, px_per_m=100).keypoints
+    pivot = mb.keypoints_to_pivot(kp)
+    side = max(width, height)
+    assert (pivot["meta"]["width"], pivot["meta"]["height"]) == (side, side)
+    j = kp.index("RIGHT_HEEL")
+    lm = pivot["frames"][0]["landmarks"]["RIGHT_HEEL"]
+    assert (lm["x"], lm["y"]) == pytest.approx(tuple(kp.xy[0, j] / side))
+    back = mb.pivot_to_keypoints(pivot, kp.clip_id, "synthetic")
+    assert (back.meta["width"], back.meta["height"]) == (width, height)
+    np.testing.assert_allclose(back.xy, kp.xy, atol=1e-6, equal_nan=True)
 
 
 def test_pivot_without_frame_size_is_rejected():
@@ -394,6 +449,99 @@ def test_input_keypoints_are_not_modified(clean_walk):
     np.testing.assert_array_equal(kp.xy, before[0])
     np.testing.assert_array_equal(kp.conf, before[1])
     assert json.dumps(kp.meta) == before[2]
+
+
+@needs_gaitkit
+def test_gk_bike_finds_synthetic_events_on_16_9_frame():
+    # MGB-1: on a non-square pivot myogait 0.9.1 hands gaitkit the leg in pixels and the
+    # feet in normalised units; gk_bike matched none of these events before the square pivot.
+    walk = simulate_walk(fps=60.0, duration_s=6.0, noise_px=1.0, px_per_m=150, width=1920, height=1080, seed=1)
+    ev = mb.detect_events_myogait(walk.keypoints, "gk_bike")
+    assert len(match_within(ev, walk.truth, 2)) >= 0.9 * len(walk.truth)
+
+
+def test_fill_leg_gaps_interpolates_inside_and_holds_edges():
+    kp = simulate_walk(fps=240.0, duration_s=1.0).keypoints
+    gapped = with_missing(with_missing(kp, ["LEFT_KNEE"], slice(100, 111)), ["RIGHT_ANKLE"], slice(230, None))
+    gapped = with_missing(gapped, ["NOSE"], slice(0, 5))  # not a leg point: left alone
+    filled, info = mb._fill_leg_gaps(gapped)
+    assert info == {"LEFT_KNEE": 11, "RIGHT_ANKLE": 10}
+    knee = filled.point("LEFT_KNEE")
+    t = kp.time_s
+    for c in range(2):
+        expected = np.interp(t[100:111], t[[99, 111]], knee[[99, 111], c])
+        np.testing.assert_allclose(knee[100:111, c], expected)
+    np.testing.assert_array_equal(filled.point("RIGHT_ANKLE")[230:], np.tile(kp.point("RIGHT_ANKLE")[229], (10, 1)))
+    assert (filled.confidence("LEFT_KNEE")[100:111] == 0).all()
+    assert np.isnan(filled.point("NOSE")[:5]).all()
+    assert np.isnan(gapped.point("LEFT_KNEE")[100:111]).all()  # the caller's copy is untouched
+    same, info = mb._fill_leg_gaps(kp)
+    assert same is kp and info == {}
+
+
+_GAP_RUNS = (("gk_bike", None), ("consensus", ["zeni", "gk_bike", "gk_zeni"]))
+
+
+@pytest.fixture(scope="module")
+def walk240_clean_events():
+    kp = simulate_walk(fps=240.0, duration_s=4.0, px_per_m=150, noise_px=1.0, seed=2).keypoints
+    return kp, {m: mb.detect_events_myogait(kp, m, consensus_methods=members) for m, members in _GAP_RUNS}
+
+
+@needs_gaitkit
+@pytest.mark.parametrize(
+    "names,frames,expected",
+    [
+        (["LEFT_KNEE"], slice(500, 511), {"LEFT_KNEE": 11}),  # 46 ms: longer than myogait bridges
+        (["RIGHT_KNEE"], slice(-43, None), {"RIGHT_KNEE": 43}),  # walker leaving the frame
+        (None, slice(300, 301), {n: 1 for n in mb._LEG_POINTS}),  # a frame with nothing detected
+    ],
+    ids=["interior-knee-gap", "trailing-gap", "empty-frame"],
+)
+def test_leg_gaps_do_not_crash_gaitkit_at_240fps(walk240_clean_events, names, frames, expected):
+    # MGB-2: gaitkit's gk_bike indexes every leg point in every frame and raised KeyError
+    # (AttributeError for an empty frame), which also killed any consensus that includes it.
+    kp, clean = walk240_clean_events
+    gapped = with_missing(kp, names or kp.names, frames)
+    for method, members in _GAP_RUNS:
+        ev = mb.detect_events_myogait(gapped, method, consensus_methods=members)
+        assert ev.attrs["myogait"]["filled_points"] == expected
+        assert len(match_within(ev, clean[method], 2)) >= 0.9 * len(clean[method]), method
+
+
+@needs_gaitkit
+@pytest.mark.parametrize("step", [4, 8])
+def test_decimated_copy_gives_same_cycle_count_as_original(step):
+    # MGB-3: myogait's cycle code assumes contiguous frames, so with source frame_idx
+    # 0, 4, 8 ... at 60 fps every cycle was 4x too long and rejected.
+    kp = simulate_walk(fps=240.0, duration_s=4.5, px_per_m=150, noise_px=1.0, seed=3).keypoints
+    low = decimate(kp, step)
+    lookup = dict(zip(low.frame_idx.tolist(), low.time_s.tolist()))
+    for method in ("zeni", "consensus"):
+        n_full = len(mb.run_myogait(kp, method)["cycles"]["cycles"])
+        res = mb.run_myogait(low, method)
+        cycles = res["cycles"]["cycles"]
+        assert n_full >= 4 and len(cycles) == n_full, method
+        assert not any(w.startswith("cycles: only") for w in res["quality"]["warnings"])
+        for c in cycles:
+            assert c["start_frame"] in lookup and c["end_frame"] in lookup
+            assert c["toe_off_frame"] is None or c["toe_off_frame"] in lookup
+            assert c["duration"] == pytest.approx(lookup[c["end_frame"]] - lookup[c["start_frame"]], abs=1e-4)
+        for key in ("left_hs", "right_hs", "left_to", "right_to"):
+            for e in res["data"]["events"][key]:
+                assert e["time"] == pytest.approx(lookup[e["frame"]])
+        assert [f["frame_idx"] for f in res["data"]["frames"]] == low.frame_idx.tolist()
+        assert mb.detect_events_myogait(low, method).attrs["myogait"]["n_cycles"] == n_full
+
+
+@needs_gaitkit
+@pytest.mark.parametrize("fps,seed,direction", [(60.0, 0, 1), (60.0, 1, -1), (240.0, 0, 1)])
+def test_default_consensus_survives_panning_camera(fps, seed, direction):
+    # MGB-5: gk_zeni and gk_bike swap HS and TO on most panning walks (upstream gaitkit);
+    # the old default consensus (zeni, gk_bike, gk_zeni, gk_oconnor) found 0-37% of these.
+    walk = simulate_walk(fps=fps, pan_speed_mps=1.3, noise_px=2.0, seed=seed, direction=direction)
+    ev = mb.detect_events_myogait(walk.keypoints, "consensus")
+    assert len(match_within(ev, walk.truth, 2)) >= 0.9 * len(walk.truth)
 
 
 # ---------------------------------------------------------------------------

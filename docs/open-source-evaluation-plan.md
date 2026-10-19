@@ -276,22 +276,32 @@ E1, E3 and E4 then move to Phase 3.
 
 ---
 
-## Proposed repo layout
+## Repo layout (as built)
+
+The harness is the `gaitbench` package. How to run it is in [harness.md](harness.md).
 
 ```
 gait_cycles/
-├── docs/                  plan, formats, decision record
-├── envs/                  requirements-myogait.txt, requirements-pose2sim.txt, ...
-├── harness/
-│   ├── pose/              run a backend on a clip → keypoints cache
-│   ├── adapters/          myogait, pose2sim, stenum_port, zeni_ref, opencap
-│   ├── scoring/           matching, metrics, Bland–Altman, plots
-│   └── labelling/         frame-stepping labeller
+├── docs/                  plan, recording protocol, harness guide, upstream issues
+├── src/gaitbench/
+│   ├── formats.py         keypoints / events / labels file formats
+│   ├── synthetic.py       synthetic walker with known events (tests only)
+│   ├── myogait_bridge.py  myogait's 15 detectors + consensus, and MediaPipe/RTMW pose
+│   ├── clean.py           leg-swap correction
+│   ├── detectors/         our Zeni and Stenum reference detectors
+│   ├── scoring/           matching, metrics, temporal parameters, Bland–Altman, ICC
+│   ├── labelling/         blind frame-stepping labeller
+│   ├── capture/           RealSense D455 recording and depth
+│   ├── io/, video.py      OpenPose import; video timestamps, copies
+│   └── cli.py             the `gaitbench` command
 ├── configs/               one YAML per run
-├── data/                  git-ignored: raw/, keypoints/, labels/
-├── golden/                golden-set clip list + expected outputs (small files only)
-└── results/               per-run CSVs and the scorecard
+├── scripts/               sample-data download, clip renaming from the session log
+├── tests/                 pytest suite (synthetic + GPJATK sample)
+├── data/                  git-ignored: raw videos, keypoints, events, labels
+└── results/runs/          git-ignored: per-run outputs
 ```
+
+Pose2Sim is not wired in yet; its `trc_gaitevents` (shortlist, section 4) needs its own environment. The golden set (E6) gets its own folder once the first real clips are labelled.
 
 ---
 
