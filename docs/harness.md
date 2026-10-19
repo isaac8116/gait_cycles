@@ -133,7 +133,7 @@ gaitbench label --data data/phone --video data/raw/phone/p01_F240_LtoR_normal_01
 gaitbench detect --data data/phone --detectors ours,myogait:zeni,myogait:oconnor,myogait:consensus
 ```
 
-`--detectors all` runs every method, including the 11 gaitkit ones, which are slower; `gaitbench list-detectors` lists them. A detector that crashes on a clip is reported and counted as having missed that clip's events, never silently left out.
+`--detectors all` runs every method, including the 11 gaitkit ones, which are slower; `gaitbench list-detectors` lists them. A detector that crashes on a clip is reported and counted as having missed that clip's events, never silently left out. For more detail on what went wrong, put `-v` before the command: `gaitbench -v detect …`.
 
 **7. Score against your labels.**
 
@@ -145,7 +145,7 @@ The table is printed and saved under `data/phone/results/score__ih/`:
 
 | File | What it holds |
 |---|---|
-| `metrics.csv` | One row per backend × detector × event type. `recall` is the share of your events found within 100 ms; `precision` is the share of detections that are real; `bias_ms` is the mean signed error (negative = early); `mae_ms` is the mean absolute error; `p_within_1_frame` / `p_within_2_frames` are judged in the scored stream's own frames (a 60 fps copy in 60 fps frames, which is what the plan's "≤ 2 frames at 60 fps" bar means); `n_clips_missing` shows clips where the detector produced nothing |
+| `metrics.csv` | One row per backend × detector × event type. `recall` is the share of your events found within 100 ms; `precision` is the share of detections that are real; `bias_ms` is the mean signed error (negative = early); `mae_ms` is the mean absolute error; `p_within_1_frame` / `p_within_2_frames` are judged in the scored stream's own frames (a 60 fps copy in 60 fps frames, which is what the plan's "≤ 2 frames at 60 fps" bar means); `n_clips_missing` counts labelled clips with no events file from that detector (it crashed or was not run there); their events count as missed. A detector that ran but found nothing has a file and simply scores recall 0 |
 | `metrics_by_side.csv` | The same, split into left and right foot (near and far side) |
 | `params.csv` | Stride time, stance %, double support % and step time per detector, against the same values from your labels (mean difference, MAE, ICC, Bland–Altman limits) |
 | `matches.csv` | Every event: matched (TP), missed (FN) or extra (FP), with its error |
@@ -183,6 +183,6 @@ For repeatable runs, put the steps in a YAML file and run `gaitbench run my_run.
 | `probe` says 30 fps for a slow-motion clip | The phone exported a slowed-down copy; transfer the original with Image Capture |
 | OpenCV can't read an iPhone `.MOV` (HEVC) | Make an H.264 copy that keeps every frame: `gaitbench cfr in.MOV in_h264.mp4 --fps 240 --run` |
 | Many false events at the same few moments | Leg swaps; score the `-clean` backend, and look at the plot |
-| A detector shows `n_clips_missing` > 0 | It crashed on those clips; run `detect -v` to see why |
+| A detector shows `n_clips_missing` > 0 | It has no events file for those clips, usually because it crashed there; run `gaitbench -v detect …` to see why |
 | `gaitbench pose` fails on Linux with `libEGL.so.1` | `sudo apt install libegl1 libgles2` (not needed on macOS) |
 | RealSense camera not listed on macOS | Try `sudo gaitbench realsense-modes`; librealsense sometimes needs root for USB on macOS |
