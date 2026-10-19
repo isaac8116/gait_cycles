@@ -1,6 +1,6 @@
 # Phone Recording Protocol
 
-16 Oct 2026 · for the phone-only route in [the evaluation plan](open-source-evaluation-plan.md#phone-only-route-while-the-d455-is-away)
+19 Oct 2026 · for the phone-only route in [the evaluation plan](open-source-evaluation-plan.md#phone-only-route-while-the-d455-is-away)
 
 What to film with one iPhone so the harness can score gait event detectors. The clips feed experiments E2 (detectors), E3 (pose models), E4 (stress conditions) and E5 (moving camera).
 
@@ -15,7 +15,11 @@ Film one 240 fps pass, copy it to the Mac and check it before filming everyone.
    ```
    `avg_frame_rate` should be about `240/1`. If it shows 30, the file is a slowed-down export; copy it again with Image Capture.
 3. **Look for flicker.** Play the clip frame by frame. If the brightness pulses or dark bands roll through the picture, the lights flicker at mains frequency. Film in daylight instead.
-4. **Check the feet.** Both feet should be sharp and fully in frame for at least three strides.
+4. **Check the framing.** The pilot passes only if all of these hold:
+   - the whole body, head to shoes, is in frame for the whole time the walker is in view, with a gap below the shoes;
+   - at least **three full strides** (six footfalls) are in view; slow motion can crop the picture, so move the phone back if fewer show;
+   - the swinging foot is sharp, not smeared, when stepping through frame by frame;
+   - nobody else appears in frame.
 
 ## Setting up the walkway
 
@@ -33,6 +37,7 @@ Film one 240 fps pass, copy it to the Mac and check it before filming everyone.
 - **Start and stop lines:** 3 m outside each edge of the frame, so walkers are at a steady pace while in view.
 - **Camera:** 3.5 m from the middle of the walking line, at right angles to it. Place it at hip height (about 1 m), in landscape. Turn on *Settings → Camera → Grid* and use the level so the phone is not tilted.
 - **Scale marks:** two short tape marks on the walking line exactly **2.00 m** apart, both in view. They give a pixel-to-metre check.
+- **Metre marks:** a short strip of tape across the walking line every **1.00 m** along its whole length, numbered 0, 1, 2… with a marker. In moving-camera clips they show how far the camera has travelled in each frame, a stand-in for the rig's encoder.
 - **Background:** a plain wall if possible, with **nobody else in frame**. Pose models can latch onto the wrong person.
 - **Light:** bright, even light from the camera side. 240 fps needs a lot of light. Avoid a bright window behind the walker.
 
@@ -61,20 +66,27 @@ A *pass* is one walk from start line to stop line. **LtoR** means the walker mov
 
 | Code | Camera | Mode | Speed | Clothing | Takes | Used for |
 |---|---|---|---|---|---|---|
+| **STAND** | Tripod | Video 60 fps | Standing still, side-on, on the scale marks, 5 s | Fitted | 1 | Body measurements and pixel scale (log `direction` as the way they face, `speed` as `stand`) |
 | **F240** | Tripod | Slo-mo 240 fps | Normal | Fitted | 2 × LtoR, 2 × RtoL | E2, E3: the core set. 60 and 30 fps copies are made from these |
 | **F240-S / F240-F** | Tripod | Slo-mo 240 fps | Slow / fast | Fitted | 1 slow LtoR, 1 fast RtoL | E4: speed |
 | **F60** | Tripod | Video 60 fps | Normal | Fitted | 1 × LtoR, 1 × RtoL | E4: real 60 fps motion blur |
 | **F240-B** | Tripod | Slo-mo 240 fps | Normal | Baggy trousers | 1 × LtoR, 1 × RtoL | E4: clothing (optional) |
 | **M240** | Rolling base | Slo-mo 240 fps | Normal | Fitted | 2 × LtoR, 2 × RtoL | E5: moving camera |
 
-That is 12–14 clips of about 10 seconds per person, roughly 20 minutes including changes.
+That is 13–15 clips of about 10 seconds per person, roughly 20 minutes including changes. Everything except M240 can be filmed alone: start recording, walk the pass, stop recording after you have left the frame.
 
-**Moving-camera takes (M240).**
-- Put the phone on a trolley, office chair or cart, at the same height and 3.5 m distance as the tripod.
-- One person pushes it along a second line taped parallel to the walking line, keeping the walker in the middle of the frame at a steady speed. Practise once first.
+**Every walking clip must:**
+- start recording before the walker sets off, and stop after they have left the frame;
+- show the walker entering and leaving the frame already walking, with no stops, turns or waving, and arms swinging normally (nothing in the hands);
+- keep the shoes in frame all the way across, with nobody else in view.
+
+**Moving-camera takes (M240).** These need a second person to push.
+- Fix the phone firmly to a box on a trolley, office chair or cart (tape it, so it cannot wobble), at about 1 m height and level, pointing straight across at the walking line.
+- Tape a second straight line parallel to the walking line, 3.5 m from it and as long. The trolley's wheels follow that line.
+- Trolley and walker start together behind the start line. The pusher starts recording, then keeps the walker in the middle of the frame at a steady speed, and keeps rolling until the walker is past the stop line. Practise once without recording.
 - If a second phone is free, leave it on the tripod filming F240 at the same time. Clap once in view of both phones at the start, for sync.
 
-**If time is short, the minimum useful set is:** 2 people × (4 F240 + 4 M240) = 16 clips.
+**If time is short, the minimum useful set is:** 2 people × (1 STAND + 4 F240 + 4 M240) = 18 clips. With nobody to push the trolley, film STAND + F240 + F240-S/F + F60 (9 clips per person) and do M240 another day.
 
 ## Logging every take
 
